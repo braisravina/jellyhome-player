@@ -6,6 +6,9 @@ on:
       - master
       - main
       - working
+      - jellyhome-privacy-fork
+  # Manual runs from the Actions tab, on any branch, to test the packaging jobs.
+  workflow_dispatch:
 # The jobs only build and upload workflow artifacts; they need no write
 # access to the repository, issues or releases, and no secrets.
 permissions:
