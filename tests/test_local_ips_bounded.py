@@ -53,8 +53,24 @@ class _LookupFixture:
         self._reset()
         self.addCleanup(self._reset)
 
-    @staticmethod
-    def _reset():
+    # Longer than a real resolver timeout (5 s measured), in case a test
+    # elsewhere reached get_local_ips unpatched.
+    LEFTOVER_JOIN = 10
+
+    @classmethod
+    def _reset(cls):
+        # A lookup thread released by a cleanup can still be waiting to run
+        # its final write to _hostname_ips. Clearing first would let that
+        # write land in the next test's cache, so wait for it. Cleanups run
+        # last-registered first, so a test's own release.set has already run
+        # and this join returns at once.
+        leftover = clients._hostname_thread
+        if leftover is not None:
+            leftover.join(cls.LEFTOVER_JOIN)
+            if leftover.is_alive():
+                raise AssertionError(
+                    "a hostname lookup thread is still running; a test left "
+                    "its resolver blocked")
         clients._hostname_thread = None
         clients._hostname_ips = []
 
@@ -172,6 +188,31 @@ class LookupResourceBoundsTest(_LookupFixture, unittest.TestCase):
         self.assertIn("returned", out.stdout)
         self.assertLess(time.monotonic() - t0, 15,
                         "interpreter exit waited for the stuck lookup")
+
+
+class FixtureIsolationTest(_LookupFixture, unittest.TestCase):
+    """A lookup an earlier test released must not write into the next one."""
+
+    def test_reset_waits_for_a_released_lookup(self):
+        release = threading.Event()
+
+        def late(*_a, **_k):
+            release.wait(30)
+            # Released, but its write still to come -- as when the scheduler
+            # runs the thread only after the test's cleanup has started.
+            time.sleep(0.05)
+            return [(None, None, None, "", ("10.4.4.4", 0))]
+
+        self.addCleanup(release.set)
+        with self._patched(late):
+            clients.get_local_ips(hostname_timeout=0.01)
+            worker = clients._hostname_thread
+            release.set()
+            self._reset()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(clients._hostname_ips, [],
+                         "a released lookup wrote after the fixture reset")
 
 
 class LookupCannotTouchTrustTest(unittest.TestCase):
