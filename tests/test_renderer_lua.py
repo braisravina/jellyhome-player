@@ -244,6 +244,18 @@ class TestRendererLua(unittest.TestCase):
         renderer before #801."""
         self._assert_suite_passed(self._run("test_image_bounds.lua"))
 
+    def test_combined_scroll_windows_change_no_pixel(self):
+        """state.merge_windows: a grid's rows drawn as ONE overlay cut from
+        their combined window buffer. Exactly one overlay-add per scrolling
+        frame for an eligible grid, none for an idle one, separate overlays
+        for file sources and carousels -- and, by a pixel oracle that
+        replays every overlay into mpv's slot order, the same picture as
+        drawing each row on its own, over a random sweep of clips,
+        occluders, dialogs, narrower rows and bitmaps floated between rows.
+        Each of the merge's safety rules has a case that fails without it.
+        """
+        self._assert_suite_passed(self._run("test_overlay_windows.lua"))
+
     def test_the_thumbfast_suite_passes(self):
         """`thumbfast.lua` is the other consumer of the trickplay frame
         file — the compatibility layer every thumbfast-style lua OSC talks

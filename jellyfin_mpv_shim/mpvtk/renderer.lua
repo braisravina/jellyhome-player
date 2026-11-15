@@ -1062,12 +1062,34 @@ local function draw_image(node, ex, ey, clip, idx)
                 args[9] = tostring(px2 - px1)
                 args[10] = tostring(py2 - py1)
             end
-            overlay_list[#overlay_list + 1] = {
+            local ov = {
                 key = node.id .. '#' .. pidx,
                 v = node.v,
                 x1 = px1, y1 = py1, x2 = px2, y2 = py2,
                 args = args,
             }
+            -- A row that Python also copied into a combined window buffer
+            -- (StripStore.window): record where this crop sits in it, so
+            -- state.merge_windows can prove a run of rows is one rectangle
+            -- of the window. Same-process memory only, never scaled or
+            -- offset into: those are the only crops whose bytes are
+            -- exactly the rows' bytes.
+            local win = node.win
+            if win and not scaled and not node.base
+                    and src:sub(1, 1) == '&' and type(win.src) == 'string'
+                    and win.src:sub(1, 1) == '&' and type(win.i) == 'number'
+                    and type(win.w) == 'number'
+                    and type(win.h) == 'number' then
+                ov.win = win
+                ov.wsx, ov.wsy = sx, (win.y or 0) + sy
+                -- The extent actually copied, which the bound above can
+                -- make one pixel short of px2/py2.
+                ov.wx2, ov.wy2 = px1 + sw, py1 + sh
+                ov.ftop = sy == 0
+                ov.fbot = sy + sh == node.ih
+                ov.fr = sx + sw == node.iw
+            end
+            overlay_list[#overlay_list + 1] = ov
         end
     end
 end
@@ -1120,6 +1142,128 @@ local function renumber_overlays()
         end
     end
     state.ov_slots, state.ov_keys, state.ov_last = ns, nk, nl
+end
+
+-- Combined scrolling overlays: one overlay-add per window per frame.
+--
+-- Every overlay-add makes mpv rebuild its WHOLE overlay atlas -- clear the
+-- power-of-two image, re-copy every live overlay into it (mpv 0.40
+-- player/command.c recreate_overlays) -- so a call costs ~0.15 ms per MB of
+-- atlas plus ~0.24 ms per MB of live overlay area, however small the bitmap
+-- it carries. A scrolling grid re-issued one overlay per visible row strip
+-- every frame: 4-6 calls, 23-30 ms a frame on a real library, enough to put
+-- the pacer past the row-snapping threshold.
+--
+-- Python copies the rows near the viewport into one contiguous, immutable
+-- window buffer (StripStore.window) and tags each row node with `win` =
+-- {src, w, h, y = the row's first line in it, i = its index, v, g}. The rows
+-- stay ordinary nodes -- hit-testing, hover, regions and focus do not
+-- change -- and draw_image still crops each one exactly as before. This
+-- runs after that: a run of crops that provably shows the same pixels as one
+-- rectangle of the window becomes a single overlay cut out of it with
+-- overlay-add's stride. Anything that does not prove it keeps its own
+-- overlay -- an edge cut (by the clip or an occluder) in the middle of a
+-- run, a row that is not the next one in the buffer, a scaled image, a file
+-- source, an overlapping bitmap painted between two rows.
+--
+-- Why the rectangle is the same picture: the window holds every member at
+-- the same pixels; the space between rows, and right of a narrower row, is
+-- transparent (alpha 0 composites to nothing); and only the top of the
+-- first crop and the bottom of the last may be cut -- an interior cut would
+-- show what the cut hid. A function field: this chunk is at the local
+-- ceiling.
+function state.merge_windows()
+    local n = #overlay_list
+    local any = false
+    for i = 1, n do
+        if overlay_list[i].win then any = true; break end
+    end
+    if not any then return end
+    local merged, skip, ordinal = {}, {}, {}
+    for i = 1, n do
+        local a = overlay_list[i]
+        if a.win and not skip[i] then
+            local w = a.win
+            local run, last, x2 = { i }, a, a.wx2
+            local between = {}   -- other overlays painted inside the run
+            for j = i + 1, n do
+                local b = overlay_list[j]
+                local bw = b.win
+                if bw and bw.src == w.src and not skip[j] then
+                    local fits = bw.i == last.win.i + 1 and last.fbot
+                        and b.ftop and b.x1 == a.x1 and b.wsx == a.wsx
+                        and b.y1 - b.wsy == a.y1 - a.wsy
+                    -- Widths may differ only where the narrower crop ends
+                    -- at its own image's right edge: past that the window
+                    -- is transparent padding.
+                    if fits then
+                        local nx2 = math.max(x2, b.wx2)
+                        if b.wx2 ~= nx2 and not b.fr then fits = false end
+                        for _, k in ipairs(run) do
+                            local m = overlay_list[k]
+                            if m.wx2 ~= nx2 and not m.fr then fits = false end
+                        end
+                        if fits then x2 = nx2 end
+                    end
+                    -- A bitmap painted between two rows was ABOVE the
+                    -- earlier ones and BELOW this one. Merged, it is above
+                    -- all of them: the same picture only if it does not
+                    -- overlap this one.
+                    if fits then
+                        for _, o in ipairs(between) do
+                            if rects_overlap(o, b) then fits = false; break end
+                        end
+                    end
+                    -- A crop that cannot join (the other side of a row a
+                    -- dialog splits) is just another overlay painted
+                    -- inside the run, and may start its own run later:
+                    -- the left pieces of the split rows merge into one
+                    -- column, the right pieces into another.
+                    if fits then
+                        run[#run + 1] = j
+                        last = b
+                    else
+                        between[#between + 1] = b
+                    end
+                else
+                    between[#between + 1] = b
+                end
+            end
+            local h, cw = last.wy2 - a.y1, x2 - a.x1
+            -- Bounds last, whatever the checks above concluded: on libmpv
+            -- the source is a raw address, and the rectangle must lie
+            -- inside the w*h*4 bytes of the window.
+            if #run >= 2 and a.wsx >= 0 and a.wsy >= 0 and cw >= 1
+                    and h >= 1 and a.wsx + cw <= (w.w or 0)
+                    and a.wsy + h <= (w.h or 0) then
+                local g = w.g or w.src
+                ordinal[g] = (ordinal[g] or 0) + 1
+                local stride = w.w * 4
+                merged[i] = {
+                    key = 'win:' .. g .. '#' .. ordinal[g],
+                    v = w.v,
+                    x1 = a.x1, y1 = a.y1, x2 = x2, y2 = last.wy2,
+                    args = {
+                        tostring(a.x1), tostring(a.y1),
+                        string.format('&%.0f', tonumber(w.src:sub(2))
+                            + a.wsy * stride + a.wsx * 4),
+                        '0', 'bgra', tostring(cw), tostring(h),
+                        tostring(stride),
+                    },
+                }
+                for k = 2, #run do skip[run[k]] = true end
+            end
+        end
+    end
+    local out = {}
+    for i = 1, n do
+        if merged[i] then
+            out[#out + 1] = merged[i]
+        elseif not skip[i] then
+            out[#out + 1] = overlay_list[i]
+        end
+    end
+    overlay_list = out
 end
 
 local function flush_overlays()
@@ -3030,6 +3174,7 @@ render = function()
     osd.data = ass.text
     osd.z = state.osd_z
     osd:update()
+    state.merge_windows()
     flush_overlays()
     if diag_t0 then state.diag_frame(diag_t0) end
     if state.observe then
