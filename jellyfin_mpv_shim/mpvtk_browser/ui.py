@@ -308,6 +308,10 @@ class UserInterface:
         strips = (StripStore(mem_store=MemoryStore()) if app.in_process
                   else StripStore(cache_dir=cache_dir("mpvtk-browser-")))
         app.scene_check = strips.dead_srcs
+        # One overlay per grid while scrolling (libmpv). On jsonipc the
+        # store has no memory backend and this only clears the markers, so
+        # rows keep their own overlays there.
+        app.scene_windows = strips.build_windows
         # Artwork outlives the session: every entry is keyed by the server's
         # own image tag, so last week's poster is still this week's poster,
         # and a scratch directory meant re-fetching a whole library on every

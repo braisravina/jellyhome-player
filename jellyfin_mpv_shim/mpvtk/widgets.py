@@ -292,9 +292,15 @@ class ImageMap(Element):
     than a thing in it (the reader's page-turn halves): no hover ring, out
     of the spatial-nav order — the ``nnav`` flag of GUIDE.md section 3. Use
     it only where the bitmap has no cells.
+
+    ``win`` names a combined scroll window: ImageMaps sharing one (the rows
+    of a virtualized grid near the viewport) may be copied into a single
+    buffer that the renderer crops as ONE overlay while scrolling -- see
+    ``MpvtkApp.scene_windows``. It changes no geometry and no pixel; a scene
+    without a window builder ignores it.
     """
 
-    def __init__(self, src, iw, ih, regions=None, v=0, **kw):
+    def __init__(self, src, iw, ih, regions=None, v=0, win=None, **kw):
         _check_raster(src, iw, ih, kw)
         super().__init__(**kw)
         self.src = src
@@ -304,6 +310,7 @@ class ImageMap(Element):
         self.lh = kw["h"]
         self.v = v
         self.regions = regions or []
+        self.win = win
 
 
 class Icon(Element):

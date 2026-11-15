@@ -461,11 +461,23 @@ class MemoryStore:
 
     GRAVEYARD = 8
 
+    #: ...and its own, smaller one for combined scroll windows (see
+    #: StripStore.window). A window is several rows in one buffer (~13 MiB
+    #: at 1080p), so parking them in the strip graveyard would hold up to
+    #: eight of them -- 100 MiB -- for a delay the generation gate already
+    #: provides: a window is only removed once it has gone unused for
+    #: PROTECT_GENERATIONS pushes. One slot is the same belt-and-braces
+    #: the strips get, at one window's cost.
+    WINDOW_GRAVEYARD = 1
+
     def __init__(self):
         import collections
 
         self._bufs = {}  # src -> ctypes buffer
         self._graveyard = collections.deque(maxlen=self.GRAVEYARD)
+        self._windows = set()  # srcs registered through adopt(window=True)
+        self._window_graveyard = collections.deque(
+            maxlen=self.WINDOW_GRAVEYARD)
 
     def add(self, pil_image):
         """Returns (src, w, h) with src usable as an Image/ImageMap
@@ -478,7 +490,25 @@ class MemoryStore:
         self._bufs[src] = buf
         return src, w, h
 
+    def adopt(self, buf, window=False):
+        """Register a ctypes buffer the caller has ALREADY filled, and
+        return its src. Filling first is the point: the src does not exist
+        until the bytes are final, so nothing can name a half-written
+        buffer in a scene."""
+        import ctypes
+
+        src = "&%d" % ctypes.addressof(buf)
+        self._bufs[src] = buf
+        if window:
+            self._windows.add(src)
+        return src
+
     def remove(self, src):
         buf = self._bufs.pop(src, None)
-        if buf is not None:
+        if buf is None:
+            return
+        if src in self._windows:
+            self._windows.discard(src)
+            self._window_graveyard.append(buf)
+        else:
             self._graveyard.append(buf)

@@ -50,6 +50,7 @@ from ..mpvtk.widgets import (
 from . import components, theme
 from .components import chrome
 from .components.detail import fmt_ticks
+from .scroll_state import ScrollState
 from .strips import Tile, logo_plate
 from .thumbnails import make_key
 
@@ -1426,6 +1427,54 @@ class TileRenderer:
         top = max(0.0, self.scroll.offset(scroll_id) - head_h)
         return int(max(0.0, top - vh) // rh), int((top + 2 * vh) // rh)
 
+    #: How far past each edge of the viewport a NEW combined scroll window
+    #: reaches, in viewport heights (see overlay_window_rows).
+    WINDOW_SLACK = 0.35
+
+    #: What the renderer may scroll on its own before the next scene push:
+    #: the scene is rebuilt every ScrollState.STEP of scrolling.
+    WINDOW_LOOKAHEAD = ScrollState.STEP
+
+    def overlay_window_rows(self, size, geom, scroll_id, head_h=0):
+        """``(first, last)`` grid rows that share the grid's combined
+        overlay window (StripStore.window).
+
+        **Sticky.** A window is a copy of its rows -- ~13 MiB at 1080p, a
+        few ms to build on this thread -- so the range is kept for as long
+        as it still covers the viewport plus WINDOW_LOOKAHEAD each way, and
+        only then re-centred with WINDOW_SLACK either side. Recomputing it
+        every push moved an edge across a row boundary on most pushes and
+        rebuilt the window each time (measured: 62% of pushes against ~25%).
+        A row outside the window still draws, as its own overlay.
+
+        Always within row_window, since only composited rows can be copied.
+        """
+        rh = geom.strip_h + GRID_GAP
+        vh = max(240.0, float(size[1]))
+        top = max(0.0, self.scroll.offset(scroll_id) - head_h)
+        rf, rl = self.row_window(size, geom, scroll_id, head_h)
+        need = (int(max(0.0, top - self.WINDOW_LOOKAHEAD) // rh),
+                int((top + vh + self.WINDOW_LOOKAHEAD) // rh))
+        held = getattr(self, "_overlay_windows", None)
+        if held is None:
+            held = {}
+            self._overlay_windows = held
+        key = (scroll_id, rh, vh, head_h)
+        prev = held.get(key)
+        if prev is not None and prev[0] <= need[0] and need[1] <= prev[1]:
+            win = prev
+        else:
+            # Never less than the lookahead, or a small viewport's fresh
+            # window would not cover what the next check requires of it.
+            slack = max(self.WINDOW_SLACK * vh, self.WINDOW_LOOKAHEAD)
+            win = (int(max(0.0, top - slack) // rh),
+                   int((top + vh + slack) // rh))
+            held.pop(key, None)
+            held[key] = win
+            while len(held) > 16:       # one per scroll container seen
+                held.pop(next(iter(held)))
+        return max(win[0], rf), min(win[1], rl)
+
     def grid_of(self, items, prefix, size, geom=None,
                  image_type="Primary", scroll_id=None, head_h=0,
                  on_click=None, inherit=True, labels=None):
@@ -1444,21 +1493,31 @@ class TileRenderer:
         rows = []
         nrows = (len(items) + cols - 1) // cols
         first, last = 0, nrows - 1
+        wfirst, wlast = 0, -1
         if scroll_id is not None:
             first, last = self.row_window(size, geom, scroll_id, head_h)
+            wfirst, wlast = self.overlay_window_rows(size, geom, scroll_id,
+                                                     head_h)
         for r in range(nrows):
             if first <= r <= last:
                 start = r * cols
-                rows.append(self.image_map(items[start:start + cols],
-                                            "%s-%d" % (prefix, start),
-                                            geom, image_type,
-                                            on_click=on_click,
-                                            inherit=inherit,
-                                            labels=labels,
-                                            # Grid rows share one bounded blank
-                                            # shape, so composite them off the
-                                            # loop thread (see StripStore.strip).
-                                            async_=scroll_id is not None))
+                el = self.image_map(items[start:start + cols],
+                                    "%s-%d" % (prefix, start),
+                                    geom, image_type,
+                                    on_click=on_click,
+                                    inherit=inherit,
+                                    labels=labels,
+                                    # Grid rows share one bounded blank
+                                    # shape, so composite them off the
+                                    # loop thread (see StripStore.strip).
+                                    async_=scroll_id is not None)
+                if wfirst <= r <= wlast:
+                    # One overlay for the rows near the viewport, while
+                    # scrolling: see StripStore.window. The row itself --
+                    # its id, regions, hover chip -- is unchanged.
+                    row = el if isinstance(el, ImageMap) else el.children[0]
+                    row.win = "%s#win" % prefix
+                rows.append(el)
             else:
                 rows.append(Spacer(h=geom.strip_h))
         if not items:

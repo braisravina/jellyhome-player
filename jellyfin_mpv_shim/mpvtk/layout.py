@@ -599,6 +599,9 @@ def _arrange_image_map(ctx, el, x, y, w, h, sc, path):
     node["ih"] = el.ih
     if el.v:
         node["v"] = el.v
+    if getattr(el, "win", None):
+        # Window group; consumed (popped) by MpvtkApp.scene_windows.
+        node["wg"] = el.win
     ctx.nodes.append(node)
     for i, reg in enumerate(el.regions):
         rid = reg.get("id") or "%s.r%d" % (node["id"], i)

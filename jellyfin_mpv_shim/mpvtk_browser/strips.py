@@ -448,6 +448,15 @@ class StripStore:
     #: trade is made by shedding on navigation.
     TIGHT_MAX_BYTES = 32 * 1024 * 1024
 
+    #: Largest combined scroll window (see :meth:`window`), and never more
+    #: than a quarter of the cache budget, so the small-machine budget gets
+    #: a small window. A window is a COPY of the rows near the viewport and
+    #: is rebuilt whenever a row enters or leaves it; ~11 MiB at 1080p. At
+    #: 4K the same span would be ~50 MiB per row crossing, so past the cap
+    #: the rows farthest from its middle are left out, and draw as their own
+    #: overlays exactly as before.
+    WINDOW_MAX_BYTES = 24 * 1024 * 1024
+
     #: How many pushed scenes back a bitmap is treated as possibly-bound.
     #: See _protected.
     PROTECT_GENERATIONS = 2
@@ -712,6 +721,163 @@ class StripStore:
             # would ever evict: a ctypes buffer on libmpv, an unlinked
             # strip*.bgra on jsonipc.
             return self._insert(ck, entry)
+
+    # -- combined scroll windows -------------------------------------------
+
+    def window_cap(self):
+        """Byte limit for one window under the current budget."""
+        return min(self.WINDOW_MAX_BYTES, self.MAX_BYTES // 4)
+
+    def window(self, members, ww, wh):
+        """One contiguous ``ww`` x ``wh`` BGRA buffer holding several
+        cached bitmaps, for the renderer to crop as ONE overlay.
+
+        Why it exists: mpv rebuilds its whole overlay atlas on every
+        overlay-add, so a scrolling grid that re-issued one overlay per
+        visible row paid that rebuild 4-6 times a frame (renderer.lua,
+        state.merge_windows, has the numbers). With the rows also copied in
+        here, the renderer issues one.
+
+        ``members`` is ``[(src, v, iw, ih, wy), ...]``: each bitmap and the
+        first line it occupies. Everything not covered by a member --
+        between rows, right of a narrower row -- is zero, i.e. transparent,
+        which is what lets the renderer draw those pixels without changing
+        the picture.
+
+        **Immutable.** The buffer is filled completely before it gets a src,
+        and is never written again: a poster arriving recomposites its row
+        under a new src and v, which is a new key and so a new window. The
+        old one stays readable until the generation gate frees it (see
+        on_scene_pushed), so mpv can never copy a half-written frame.
+
+        Same-process memory (libmpv) only; returns None on jsonipc, for
+        fewer than two members, or if any member is no longer held.
+        """
+        if self.mem is None or len(members) < 2 or ww < 1 or wh < 1:
+            return None
+        members = tuple((str(s), int(v), int(iw), int(ih), int(wy))
+                        for s, v, iw, ih, wy in members)
+        # v is in the key for the reason _store gives: addresses recycle,
+        # and a recycled member src must not find the old window.
+        key = ("window", int(ww), int(wh), members)
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit is not None:
+                self._touch(key)
+                self.hits += 1
+                return hit
+            self.misses += 1
+        import ctypes
+
+        row = ww * 4
+        buf = ctypes.create_string_buffer(row * wh)   # zero = transparent
+        base = ctypes.addressof(buf)
+        with self._lock:
+            # Under the lock: nothing may free a member while it is read.
+            for src, _v, iw, ih, wy in members:
+                sbuf = self.mem._bufs.get(src)
+                if (sbuf is None or len(sbuf) != iw * ih * 4 or iw > ww
+                        or wy < 0 or wy + ih > wh):
+                    return None
+                saddr = ctypes.addressof(sbuf)
+                if iw == ww:
+                    ctypes.memmove(base + wy * row, saddr, iw * ih * 4)
+                else:
+                    line = iw * 4
+                    for y in range(ih):
+                        ctypes.memmove(base + (wy + y) * row,
+                                       saddr + y * line, line)
+            hit = self._cache.get(key)
+            if hit is not None:
+                self._touch(key)
+                return hit
+            self._counter += 1
+            entry = {"src": self.mem.adopt(buf, window=True),
+                     "iw": int(ww), "ih": int(wh), "v": self._counter,
+                     "window": True}
+            return self._insert(key, entry)
+
+    def build_windows(self, nodes):
+        """MpvtkApp.scene_windows: give each grid's rows one window.
+
+        Runs on the laid-out, PHYSICAL scene, because the window has to put
+        each row on exactly the line the renderer will -- which only the
+        scaled positions say. A group is the img nodes sharing a ``wg``
+        (tile_renderer.grid_of marks the rows near the viewport); each is
+        tagged with ``win`` = {src, w, h, y, i, v, g} for renderer.lua.
+
+        Anything this cannot prove lines up is left alone, and renders as
+        it always has: rows in different containers or columns, a
+        fractional y, overlapping rows, a scaled or file-backed image.
+        """
+        groups = {}
+        for node in nodes:
+            g = node.pop("wg", None)
+            if g is not None:
+                groups.setdefault(g, []).append(node)
+        if self.mem is None:
+            return
+        for g, rows in groups.items():
+            try:
+                self._window_group(g, rows)
+            except Exception:
+                log.debug("scroll window %s skipped", g, exc_info=True)
+
+    def _window_group(self, g, rows):
+        if len(rows) < 2:
+            return
+        sc, x = rows[0].get("sc"), rows[0].get("x")
+        # Lines relative to the first row. They must be whole: the renderer
+        # floors every row's position against the same scroll offset, so
+        # rows a whole number of lines apart keep exactly that distance on
+        # every frame, however fractional the positions themselves are
+        # (grid rows sit at .5 at scale 1). renderer.lua re-checks this per
+        # frame and draws rows separately on any frame it does not hold.
+        y0 = float(rows[0]["y"])
+        ys, iws, ihs = [], [], []
+        for n in rows:
+            src = n.get("src")
+            if (n.get("t") != "img" or not isinstance(src, str)
+                    or not src.startswith("&") or "dw" in n or "dh" in n
+                    or "base" in n or n.get("sc") != sc or n.get("x") != x):
+                return
+            dy = float(n["y"]) - y0
+            if abs(dy - round(dy)) > 1e-6:
+                return
+            ys.append(int(round(dy)))
+            iws.append(int(n["iw"]))
+            ihs.append(int(n["ih"]))
+        for k in range(1, len(rows)):
+            if ys[k] < ys[k - 1] + ihs[k - 1]:
+                return
+        lo, hi = 0, len(rows) - 1
+        cap = self.window_cap()
+
+        def size(a, b):
+            return max(iws[a:b + 1]) * (ys[b] - ys[a] + ihs[b]) * 4
+
+        # The marked rows are centred on the viewport, so trim both ends
+        # alternately to keep what is on screen.
+        drop_end = True
+        while hi > lo and size(lo, hi) > cap:
+            if drop_end:
+                hi -= 1
+            else:
+                lo += 1
+            drop_end = not drop_end
+        if hi <= lo:
+            return
+        ww = max(iws[lo:hi + 1])
+        wh = ys[hi] - ys[lo] + ihs[hi]
+        members = [(rows[k]["src"], int(rows[k].get("v", 0)), iws[k], ihs[k],
+                    ys[k] - ys[lo]) for k in range(lo, hi + 1)]
+        entry = self.window(members, ww, wh)
+        if entry is None:
+            return
+        for i, k in enumerate(range(lo, hi + 1)):
+            rows[k]["win"] = {"src": entry["src"], "w": ww, "h": wh,
+                              "y": ys[k] - ys[lo], "i": i,
+                              "v": entry["v"], "g": g}
 
     def clear(self):
         """Drop every cached bitmap and release its backing buffer.
@@ -1615,6 +1781,17 @@ class StripStore:
         with self._lock:
             self._gen += 1
             self._marked = True
+            # A window is worth nothing once it has aged out of the
+            # protected span: it is a copy, and is rebuilt on every row
+            # crossing. Leaving it to the LRU would let a scroll park a
+            # stack of them under the byte budget, pushing out strips that
+            # ARE worth keeping.
+            stale = [k for k, e in self._cache.items()
+                     if e.get("window") and not self._protected(e)]
+            for key in stale:
+                old = self._cache.pop(key)
+                self._bytes -= self._entry_bytes(old)
+                self._free(old["src"])
             if self._trim_at is not None and self._gen >= self._trim_at:
                 self._trim_at = None
                 self._trim_to(0)
@@ -1668,6 +1845,22 @@ class StripStore:
             elif len(buf) != node["iw"] * node["ih"] * 4:
                 dead.append("%s is %d bytes, node says %dx%d"
                             % (src, len(buf), node["iw"], node["ih"]))
+            win = node.get("win")
+            if isinstance(win, dict):
+                # The renderer reads the row's lines out of the window by
+                # address too, so the same two failures apply to it -- plus
+                # a row that would run past the window's last line.
+                wsrc = win.get("src")
+                wbuf = bufs.get(wsrc)
+                if wbuf is None:
+                    dead.append("window %s freed" % wsrc)
+                elif len(wbuf) != win["w"] * win["h"] * 4:
+                    dead.append("window %s is %d bytes, node says %dx%d"
+                                % (wsrc, len(wbuf), win["w"], win["h"]))
+                elif (win["y"] < 0 or win["y"] + node["ih"] > win["h"]
+                        or node["iw"] > win["w"]):
+                    dead.append("window %s cannot hold %s at line %d"
+                                % (wsrc, src, win["y"]))
         return dead
 
     def set_memory_pressure(self, tight):

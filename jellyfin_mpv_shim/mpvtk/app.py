@@ -263,6 +263,15 @@ class MpvtkApp:
     scene_check = None
     check_scenes = False
 
+    #: ``scene_windows(nodes)``, run on every laid-out PHYSICAL scene before
+    #: it is checked and pushed. The browser points it at
+    #: StripStore.build_windows, which copies a grid's rows into one buffer
+    #: and tags them so the renderer issues one overlay-add per grid per
+    #: scrolling frame instead of one per row. It must remove the ``wg``
+    #: markers layout leaves; None (and any exception) leaves every image
+    #: rendering on its own, as it always did. Class-level as above.
+    scene_windows = None
+
     #: The artwork-repaint throttle's state, class-level for the same reason:
     #: the run loop reads both on its very first pass, so an instance that
     #: skipped __init__ would raise before it ever drew anything.
@@ -685,6 +694,19 @@ class MpvtkApp:
         # renderer pins the ASS PlayRes to them, and overlay bitmaps
         # composite in real pixels regardless.
         scaling.scale_scene(nodes)
+        windowed = False
+        if self.scene_windows is not None:
+            try:
+                self.scene_windows(nodes)
+                windowed = True
+            except Exception:
+                log.debug("scene windows failed; rows draw separately",
+                          exc_info=True)
+        if not windowed:
+            # Nothing consumed the group markers: they are layout's note to
+            # a window builder, not part of the renderer protocol.
+            for node in nodes:
+                node.pop("wg", None)
         if self.check_scenes and self.scene_check is not None:
             dead = self.scene_check(nodes)
             if dead:
