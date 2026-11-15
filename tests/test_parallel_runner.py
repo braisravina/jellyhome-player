@@ -81,5 +81,153 @@ class ParallelRunnerCoversTheSuiteTest(unittest.TestCase):
         self.assertGreater(len(_runner()._modules()), 100)
 
 
+def _mixed_suite():
+    """One test of every outcome unittest knows, plus a class skipped in
+    setUpClass -- whose two tests are never started at all."""
+
+    class Mixed(unittest.TestCase):
+        def test_passes(self):
+            pass
+
+        def test_passes_too(self):
+            pass
+
+        def test_fails(self):
+            self.fail("boom")
+
+        def test_errors(self):
+            raise RuntimeError("bang")
+
+        @unittest.skip("needs a frobnicator")
+        def test_skipped(self):
+            pass
+
+        @unittest.expectedFailure
+        def test_expected_failure(self):
+            self.fail("known")
+
+        @unittest.expectedFailure
+        def test_unexpected_success(self):
+            pass
+
+    class SkippedClass(unittest.TestCase):
+        @classmethod
+        def setUpClass(cls):
+            raise unittest.SkipTest("needs a frobnicator")
+
+        def test_one(self):
+            pass
+
+        def test_two(self):
+            pass
+
+    loader = unittest.TestLoader()
+    return unittest.TestSuite([loader.loadTestsFromTestCase(Mixed),
+                               loader.loadTestsFromTestCase(SkippedClass)])
+
+
+def _run(runner, suite):
+    import io
+
+    return unittest.TextTestRunner(
+        stream=io.StringIO(), verbosity=0,
+        resultclass=runner._counting_result()).run(suite)
+
+
+class RunnerReportingTest(unittest.TestCase):
+    """The summary must tell a skipped test from a passing one.
+
+    RESULT (total, failures, errors) reads a skip exactly like a pass, so
+    the 22 renderer tests that skip without a Lua interpreter were reported
+    as part of a green suite on every machine that had none."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.runner = _runner()
+
+    def test_each_outcome_is_counted_separately(self):
+        suite = _mixed_suite()
+        outcome = self.runner._outcome(_run(self.runner, suite))
+        self.assertEqual(suite.countTestCases(), 9)
+        self.assertEqual(
+            {k: outcome[k] for k in self.runner.COUNTS},
+            {"run": 7, "passed": 2, "failures": 1, "errors": 1, "skipped": 2,
+             "expected_failures": 1, "unexpected_successes": 1})
+        self.assertEqual([r for _t, r in outcome["skips"]],
+                         ["needs a frobnicator"] * 2)
+
+    def test_skipped_tests_are_never_counted_as_passed(self):
+        class OnlySkips(unittest.TestCase):
+            @unittest.skip("no interpreter")
+            def test_a(self):
+                pass
+
+            def test_b(self):
+                self.skipTest("no interpreter")
+
+        result = _run(self.runner,
+                      unittest.TestLoader().loadTestsFromTestCase(OnlySkips))
+        self.assertTrue(result.wasSuccessful())     # what RESULT sees
+        outcome = self.runner._outcome(result)
+        self.assertEqual((outcome["run"], outcome["passed"], outcome["skipped"]),
+                         (2, 0, 2))
+
+    def test_the_worker_lines_round_trip(self):
+        suite = _mixed_suite()
+        result = _run(self.runner, suite)
+        lines = self.runner._report_lines(suite.countTestCases(), result)
+        # RESULT keeps exactly four fields: tools/mutate_round.py unpacks it.
+        self.assertEqual(lines[0].split(), ["JMS-RESULT", "9", "1", "1"])
+        count, bad, reported, outcome = self.runner._parse_worker_output(
+            "noise\n" + "\n".join(lines) + "\nPLAYER-TEARDOWN x\n")
+        self.assertEqual((count, bad, reported), (9, 2, True))
+        self.assertEqual(outcome, self.runner._outcome(result))
+
+    def test_a_worker_that_never_reported_has_no_outcome(self):
+        self.assertEqual(self.runner._parse_worker_output("Traceback ...\n"),
+                         (0, 0, False, None))
+        # A stray or malformed line from a test must not crash the parent.
+        self.assertEqual(
+            self.runner._parse_worker_output(
+                "JMS-RESULT what\nJMS-OUTCOME {not json\n"),
+            (0, 0, False, None))
+
+    def test_the_summary_groups_skips_by_reason_and_module(self):
+        def oc(run, passed, skips):
+            return {"run": run, "passed": passed, "failures": 0, "errors": 0,
+                    "skipped": len(skips), "expected_failures": 0,
+                    "unexpected_successes": 0,
+                    "skips": [["t%d" % i, r] for i, r in enumerate(skips)]}
+
+        summary = self.runner._summarize([
+            ("test_lua.py", 0, 3, oc(3, 0, ["no Lua"] * 3)),
+            ("test_other.py", 0, 5, oc(5, 3, ["no Lua", "no msgfmt"])),
+            ("test_class_skip.py", 0, 4, oc(1, 0, ["no msgfmt"])),
+            ("test_crashed.py", 1, 7, None),
+        ])
+        t = summary["totals"]
+        self.assertEqual((t["collected"], t["run"], t["passed"], t["skipped"],
+                          t["not_run"]), (19, 9, 3, 6, 3))
+        self.assertEqual(summary["unreported"], ["test_crashed.py"])
+        self.assertEqual(summary["skips"], [
+            {"reason": "no Lua", "count": 4,
+             "modules": {"test_lua.py": 3, "test_other.py": 1}},
+            {"reason": "no msgfmt", "count": 2,
+             "modules": {"test_class_skip.py": 1, "test_other.py": 1}}])
+        text = "\n".join(self.runner._format_summary(summary))
+        self.assertIn("9 run -- 3 passed, 0 failed, 0 errors, 6 skipped", text)
+        self.assertIn("      4  no Lua\n         in test_lua.py (3), "
+                      "test_other.py (1)", text)
+        self.assertIn("3 collected tests never started", text)
+        self.assertIn("no outcome reported by 1 modules", text)
+        self.assertIn("test_crashed.py", text)
+
+    def test_a_run_without_skips_says_so(self):
+        summary = self.runner._summarize([("test_a.py", 0, 1, {
+            "run": 1, "passed": 1, "failures": 0, "errors": 0, "skipped": 0,
+            "expected_failures": 0, "unexpected_successes": 0, "skips": []})])
+        self.assertIn("skipped: none", self.runner._format_summary(summary))
+
+
 if __name__ == "__main__":
     unittest.main()

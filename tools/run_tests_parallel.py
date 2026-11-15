@@ -39,6 +39,7 @@ than the serial run gives it.
 """
 
 import argparse
+import json
 import os
 import shutil
 import signal
@@ -66,6 +67,157 @@ def _start_mypy_gate():
 #: What a worker prints once its tests are done. The parent reads THIS, not
 #: the exit status -- see _worker.
 RESULT = "JMS-RESULT"
+
+#: The full outcome, one JSON object on one line, printed beside RESULT.
+#: RESULT keeps its four fields (total, failures, errors) because
+#: tools/mutate_round.py and tools/run_modules_serial.sh read it as is.
+#: This line is what tells a skipped test from a passing one: RESULT
+#: counts both as "not a failure", which is how 22 renderer tests went
+#: unrun on every machine without a Lua interpreter and still read OK.
+OUTCOME = "JMS-OUTCOME"
+
+#: Outcome counters, in report order. "passed" is counted from addSuccess,
+#: never derived by subtraction, so nothing else can be mistaken for it.
+COUNTS = ("run", "passed", "failures", "errors", "skipped",
+          "expected_failures", "unexpected_successes")
+
+
+def _counting_result():
+    """A TextTestResult that also counts successes. Built lazily so that
+    importing this module does not import unittest's runner for nothing."""
+    import unittest
+
+    class CountingResult(unittest.TextTestResult):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.successes = 0
+
+        def addSuccess(self, test):
+            super().addSuccess(test)
+            self.successes += 1
+
+    return CountingResult
+
+
+def _outcome(result):
+    """The JSON-able outcome of one module's run.
+
+    ``skips`` holds every skip with its reason. A skip raised in
+    setUpClass or setUpModule is recorded once, against the class or
+    module, and the tests under it are not run at all -- so ``run`` can
+    be lower than the module's test count, and the difference is reported
+    as ``not_run`` by the parent.
+    """
+    def ident(test):
+        try:
+            return test.id()
+        except Exception:
+            return str(test)
+
+    return {
+        "run": result.testsRun,
+        "passed": getattr(result, "successes", 0),
+        "failures": len(result.failures),
+        "errors": len(result.errors),
+        "skipped": len(result.skipped),
+        "expected_failures": len(result.expectedFailures),
+        "unexpected_successes": len(result.unexpectedSuccesses),
+        "skips": [[ident(t), str(reason)] for t, reason in result.skipped],
+    }
+
+
+def _report_lines(total, result):
+    """The two lines a worker prints once its tests are done."""
+    return ["%s %d %d %d" % (RESULT, total, len(result.failures),
+                             len(result.errors)),
+            "%s %s" % (OUTCOME, json.dumps(_outcome(result),
+                                           separators=(",", ":")))]
+
+
+def _parse_worker_output(out):
+    """``(count, bad, reported, outcome)`` from one worker's output.
+
+    ``reported`` is False when the RESULT line never arrived -- a crash,
+    an import that exited, a kill -- and the module is then a failure
+    however the process exited. ``outcome`` is None for a worker that
+    printed RESULT but no OUTCOME (it cannot happen with this runner, but
+    a module that writes a stray RESULT line of its own must not crash
+    the parent)."""
+    count, bad, reported, outcome = 0, 0, False, None
+    for line in out.splitlines():
+        if line.startswith(RESULT + " "):
+            try:
+                _tag, n, fails, errs = line.split()
+                count, bad, reported = int(n), int(fails) + int(errs), True
+            except ValueError:
+                continue
+        elif line.startswith(OUTCOME + " "):
+            try:
+                outcome = json.loads(line[len(OUTCOME) + 1:])
+            except ValueError:
+                continue
+    return count, bad, reported, outcome
+
+
+def _summarize(records):
+    """Totals over every module, from ``(module, rc, count, outcome)``.
+
+    A module without an outcome (it crashed, timed out or never
+    reported) contributes nothing to the counters and is listed under
+    ``unreported``: its tests were neither passed nor skipped, and adding
+    its declared count to anything would claim otherwise."""
+    totals = {k: 0 for k in COUNTS}
+    totals["collected"] = 0
+    totals["not_run"] = 0
+    by_reason = {}          # reason -> {module: count}
+    unreported = []
+    for mod, _rc, count, outcome in records:
+        totals["collected"] += count
+        if outcome is None:
+            unreported.append(mod)
+            continue
+        for k in COUNTS:
+            totals[k] += int(outcome.get(k, 0))
+        # A setUpClass skip covers tests that were never started; count
+        # them so that collected = run + not_run + (unreported modules).
+        totals["not_run"] += max(0, count - int(outcome.get("run", 0)))
+        for _test, reason in outcome.get("skips", ()):
+            mods = by_reason.setdefault(reason, {})
+            mods[mod] = mods.get(mod, 0) + 1
+    skips = sorted(
+        ({"reason": r, "count": sum(m.values()), "modules": dict(sorted(m.items()))}
+         for r, m in by_reason.items()),
+        key=lambda s: (-s["count"], s["reason"]))
+    return {"totals": totals, "skips": skips, "unreported": sorted(unreported)}
+
+
+def _format_summary(summary):
+    """The human-readable counter and skip lines for ``summary``."""
+    t = summary["totals"]
+    lines = ["results: %d run -- %d passed, %d failed, %d errors, %d skipped, "
+             "%d expected failures, %d unexpected successes"
+             % (t["run"], t["passed"], t["failures"], t["errors"],
+                t["skipped"], t["expected_failures"],
+                t["unexpected_successes"])]
+    if t["not_run"]:
+        lines.append("not run: %d collected tests never started (a "
+                     "setUpClass/setUpModule skip or error)" % t["not_run"])
+    if summary["unreported"]:
+        lines.append("no outcome reported by %d modules (crashed or timed "
+                     "out): %s" % (len(summary["unreported"]),
+                                   " ".join(summary["unreported"])))
+    if summary["skips"]:
+        lines.append("skipped, by reason:")
+        for s in summary["skips"]:
+            reason = (s["reason"].splitlines() or [""])[0]
+            if len(reason) > 160:
+                reason = reason[:157] + "..."
+            lines.append("  %5d  %s" % (s["count"], reason or "(no reason given)"))
+            lines.append("         in " + ", ".join(
+                "%s (%d)" % (m, n) for m, n in s["modules"].items()))
+    else:
+        lines.append("skipped: none")
+    return lines
 
 
 def _utf8(stream):
@@ -97,9 +249,10 @@ def _worker(pattern):
 
     suite = unittest.TestLoader().discover(TESTS, pattern=pattern)
     total = suite.countTestCases()
-    result = unittest.TextTestRunner(verbosity=1).run(suite)
-    print("%s %d %d %d" % (RESULT, total, len(result.failures),
-                           len(result.errors)))
+    result = unittest.TextTestRunner(
+        verbosity=1, resultclass=_counting_result()).run(suite)
+    for line in _report_lines(total, result):
+        print(line)
     sys.stdout.flush()
 
     # os._exit, deliberately: skip interpreter teardown entirely.
@@ -286,6 +439,9 @@ def main():
     ap.add_argument("-t", "--timeout", type=float, default=300.0,
                     help="seconds a single module may take before it is "
                          "killed and reported as failed (default: 300)")
+    ap.add_argument("--report", metavar="PATH",
+                    help="also write the totals, every skip with its reason, "
+                         "and each module's outcome to PATH as JSON")
     ap.add_argument("--worker", metavar="PATTERN",
                     help=argparse.SUPPRESS)   # internal
     args = ap.parse_args()
@@ -309,7 +465,7 @@ def main():
     gate = _start_mypy_gate()
     pending = list(modules)
     running = {}          # Popen -> (module, started)
-    done = []             # (module, rc, seconds, output, count)
+    done = []             # (module, rc, seconds, output, count, outcome)
     started = time.time()
 
     def launch():
@@ -385,11 +541,7 @@ def main():
             # The writer is gone, so the reader is at EOF or a breath away.
             pump.join(timeout=30)
             out = "".join(sink)
-            count, bad, reported = 0, 0, False
-            for line in out.splitlines():
-                if line.startswith(RESULT + " "):
-                    _tag, n, fails, errs = line.split()
-                    count, bad, reported = int(n), int(fails) + int(errs), True
+            count, bad, reported, outcome = _parse_worker_output(out)
             # No result line means the worker died before it could report:
             # a crash during the tests, an import that exited, a kill. That
             # is a failure however the process happened to exit.
@@ -399,11 +551,14 @@ def main():
                         "alone; suspect contention for the X server or for "
                         "mpv, or a real hang inside the module.\n"
                         % args.timeout)
-            done.append((mod, rc, time.time() - t0, out, count))
+            done.append((mod, rc, time.time() - t0, out, count, outcome))
             if not args.quiet:
-                print("%-4s %5.1fs %4d  %s"
+                skipped = (outcome or {}).get("skipped", 0)
+                print("%-4s %5.1fs %4d  %s%s"
                       % ("FAIL" if rc else "ok",
-                         time.time() - t0, count, mod), flush=True)
+                         time.time() - t0, count, mod,
+                         "  (%d skipped)" % skipped if skipped else ""),
+                      flush=True)
             launch()
         if running:
             time.sleep(0.02)
@@ -413,20 +568,25 @@ def main():
     total = sum(d[4] for d in done)
     slowest = sorted(done, key=lambda d: -d[2])[:5]
 
-    for mod, _rc, secs, out, _n in failed:
+    for mod, _rc, secs, out, _n, _oc in failed:
         print("\n" + "=" * 70 + "\nFAILED: %s (%.1fs)\n" % (mod, secs) + "=" * 70)
         print(out.rstrip())
 
+    summary = _summarize([(m, rc, n, oc) for m, rc, _s, _o, n, oc in done])
     print("\n%d tests in %d modules, %d workers, %.1fs wall clock"
           % (total, len(done), jobs, elapsed))
-    print("slowest: " + ", ".join("%s %.1fs" % (m, s) for m, _r, s, _o, _n
-                                  in slowest))
+    print("slowest: " + ", ".join("%s %.1fs" % (m, s)
+                                  for m, _r, s, *_rest in slowest))
+    for line in _format_summary(summary):
+        print(line)
     gate_failed = False
     if gate is None:
+        gate_status = "skipped"
         print("mypy gate: SKIPPED (needs mypy, and not Windows)")
     else:
         out, _ = gate.communicate()
         gate_failed = gate.returncode != 0
+        gate_status = "failed" if gate_failed else "ok"
         if gate_failed:
             print("\n" + "=" * 70 + "\nFAILED: tools/mypy_gate.sh\n"
                   + "=" * 70 + "\n" + out.rstrip())
@@ -434,10 +594,31 @@ def main():
             print("mypy gate: ok")
     if failed:
         print("FAILED modules: " + " ".join(sorted(m for m, *_ in failed)))
+    if args.report:
+        _write_report(args.report, summary, done, gate_status, jobs, elapsed)
     if failed or gate_failed:
         return 1
-    print("OK")
+    skipped = summary["totals"]["skipped"]
+    print("OK (%d skipped)" % skipped if skipped else "OK")
     return 0
+
+
+def _write_report(path, summary, done, gate_status, jobs, elapsed):
+    """``--report``: the summary plus one record per module, as JSON."""
+    modules = []
+    for mod, rc, secs, _out, count, outcome in sorted(done):
+        rec = {"module": mod, "status": "failed" if rc else "ok",
+               "seconds": round(secs, 1), "collected": count,
+               "reported": outcome is not None}
+        if outcome is not None:
+            rec.update({k: outcome.get(k, 0) for k in COUNTS})
+            rec["skips"] = outcome.get("skips", [])
+        modules.append(rec)
+    doc = dict(summary, mypy_gate=gate_status, workers=jobs,
+               seconds=round(elapsed, 1), modules=modules)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=1, sort_keys=True)
+        fh.write("\n")
 
 
 if __name__ == "__main__":

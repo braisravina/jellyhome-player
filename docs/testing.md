@@ -321,6 +321,35 @@ is one process and nothing splits it.
 about itself: the modules it would run are the modules discover collects. A
 module it silently skips reports exactly like a module that passed.
 
+### Reading the summary: a skip is not a pass
+
+The summary counts every outcome separately — run, passed, failed, errors,
+skipped, expected failures, unexpected successes — and then lists each skip
+reason with the modules it came from and how many tests it covered:
+
+```
+results: 7571 run -- 7524 passed, 1 failed, 0 errors, 46 skipped, 0 expected failures, 0 unexpected successes
+skipped, by reason:
+     22  no Lua interpreter (tried: luajit, lua5.1, lua5.2, lua5.3, lua5.4, lua)
+         in test_renderer_lua.py (22)
+      9  mpv is not on PATH
+         in test_mpv_stat_properties.py (1), test_picture_processing.py (8)
+      ...
+```
+
+(An excerpt from a Debian 13 laptop, 2026-11-16; the rest are font-availability
+skips.) Before this, the only total was "N tests", which included skipped
+ones: those 46 tests went unrun, and the run still read OK. "passed" is counted from successes, never derived by
+subtraction. Tests that never started (a skip or error in `setUpClass`) are
+reported as "not run", and a module that crashed reports no outcome, so its
+tests count toward neither passed nor skipped.
+
+Each worker prints its four-field `JMS-RESULT` line as before, which
+`tools/mutate_round.py` and `tools/run_modules_serial.sh` read, plus one
+`JMS-OUTCOME` JSON line carrying the full counts and skips. `--report PATH`
+writes the same totals, the skips and one record per module as JSON, for CI.
+Skips do not change the exit status.
+
 ### The parallel runner cannot see cross-module interference, and that is the trade
 
 One process per module means a module that poisons the interpreter poisons only
