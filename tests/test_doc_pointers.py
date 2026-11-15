@@ -25,8 +25,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: this one, which it could not do while it was still untracked (that is
 #: why it passed before it was committed and failed straight after).
 #: Anchored to a path separator, so bare prose like "the MIGRATION.md
-#: write-up" never becomes a finding and needs no excusing.
-CITE = re.compile(r'(?<![\w./-])((?:[A-Za-z_][\w-]*/)+[A-Za-z_][\w.-]*\.md)')
+#: write-up" never becomes a finding and needs no excusing. Nor does a
+#: path under a shell variable (`$` excluded too): that is a file a
+#: script writes, relative to wherever the variable points.
+CITE = re.compile(r'(?<![\w./$-])((?:[A-Za-z_][\w-]*/)+[A-Za-z_][\w.-]*\.md)')
 
 #: Documents that are GONE and are cited to say so. A pointer that
 #: explains its own absence is not a dead pointer.
@@ -130,3 +132,18 @@ class DocPointersTest(unittest.TestCase):
         found = CITE.findall("see docs/development.md for the rest")
         self.assertEqual(found, ["docs/development.md"])
         self.assertEqual(CITE.findall("https://example.com/a/b.md"), [])
+
+    def test_shell_variable_paths_are_not_citations(self):
+        """A path under a shell variable names a file a script WRITES,
+        relative to wherever that variable points -- not a document in
+        this tree. linux/build-deb.sh copies the notices to
+        "$doc/LICENSE.md" and similar, and each one used to be reported
+        as a dead citation."""
+        for text in ('cp LICENSE.md "$doc/LICENSE.md"',
+                     'install -m644 x "$lib/sub/NOTICE.md"',
+                     'echo $DESTDIR/docs/README.md'):
+            self.assertEqual(CITE.findall(text), [], text)
+        # ...while a real citation on the same line is still found.
+        self.assertEqual(
+            CITE.findall('cp a "$doc/LICENSE.md"  # see docs/development.md'),
+            ["docs/development.md"])
