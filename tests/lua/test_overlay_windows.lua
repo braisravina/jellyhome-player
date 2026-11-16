@@ -437,5 +437,405 @@ do
        "\n  plain:    " .. a .. "\n  windowed: " .. b)
 end
 
+-- ============================================================ 6. stacked carousels
+-- The Home page: carousel strips, each in its OWN horizontal scroll, stacked
+-- in one vertical scroll, with a heading between rows. Python groups them as
+-- a SiblingWindow (strips.py) and copies only each strip's leading viewport
+-- width -- so the window is narrower than the strips. Every carousel still
+-- scrolls sideways on its own; whatever the offsets, the picture must be the
+-- one the rows draw without a window.
+local LEAD = 6
+local function stack(rows, opts)
+    bitmaps = {}
+    local sx, sy = opts.sx or 0, opts.sy or 0
+    local vw, vh = opts.vw or SW, opts.vh or SH
+    local nodes = {
+        { id = "home", t = "scroll", axis = "y", x = sx, y = sy, w = vw,
+          h = vh, cw = vw, ch = 4000 },
+    }
+    -- Each carousel's own viewport width: the view's, unless `r.view` says
+    -- otherwise or `opts.fit` lays it out as the real one is -- only as wide
+    -- as its content when that is narrower (My Media, a short section).
+    local views, copies = {}, {}
+    for k, r in ipairs(rows) do
+        views[k] = r.view or (opts.fit and math.min(vw, r.iw + 2 * LEAD)) or vw
+        -- StripStore._sibling_copies: what that carousel at rest shows of its
+        -- strip (its viewport's right edge minus the strip's inset), plus a
+        -- rounding line, never more than the strip.
+        copies[k] = math.min(r.iw, views[k] - LEAD + 1)
+    end
+    local ww, wh = 0, 0
+    for k, r in ipairs(rows) do
+        ww = math.max(ww, copies[k])
+        wh = math.max(wh, r.wy + r.ih)
+    end
+    add_bitmap(WINBASE, ww, wh, function(x, y)
+        for k, r in ipairs(rows) do
+            if y >= r.wy and y < r.wy + r.ih and x < copies[k] then
+                return k * 1000000 + (y - r.wy) * 1000 + x + 1
+            end
+        end
+        return 0
+    end)
+    for k, r in ipairs(rows) do
+        local base = ROWBASE * k
+        add_bitmap(base, r.iw, r.ih, function(x, y)
+            return k * 1000000 + y * 1000 + x + 1
+        end)
+        local cid = "c" .. k
+        nodes[#nodes + 1] = { id = "h" .. k, t = "text", sc = "home",
+            text = "Row " .. k, x = sx + LEAD, y = r.y - 3, w = 30, h = 3,
+            size = 3, c = "ffffff" }
+        nodes[#nodes + 1] = { id = cid, t = "scroll", axis = "x", sc = "home",
+            x = sx, y = r.y - 1, w = views[k], h = r.ih + 2,
+            cw = r.iw + 2 * LEAD, ch = r.ih + 2 }
+        local node = { id = "row" .. k, t = "img", sc = cid,
+            src = "&" .. base, iw = r.iw, ih = r.ih, v = 1,
+            x = sx + LEAD, y = r.y, w = r.iw, h = r.ih }
+        if opts.win then
+            node.win = { src = "&" .. WINBASE, w = ww, h = wh, y = r.wy,
+                         i = k - 1, v = 3, g = "home#win" }
+        end
+        nodes[#nodes + 1] = node
+        nodes[#nodes + 1] = { id = "row" .. k .. "-t", t = "rect", sc = cid,
+            x = sx + LEAD, y = r.y, w = math.min(r.iw, 20), h = r.ih,
+            ring = true, click = true, hev = true }
+        if opts.chip == k then
+            -- the hover play chip, inside the carousel so it travels with it
+            add_bitmap(CHIPBASE, 8, 8, function() return 77 end)
+            nodes[#nodes + 1] = { id = "chip", t = "img", sc = cid,
+                src = "&" .. CHIPBASE, iw = 8, ih = 8, v = 1,
+                x = sx + LEAD + (opts.chip_dx or 2),
+                y = r.y + (opts.chip_dy or 2), w = 8, h = 8 }
+        end
+        if opts.arrows == k then
+            -- overlay-mode page arrows: bitmaps over the row's two edges,
+            -- outside its scroll (hscroll_row's Stack)
+            add_bitmap(CHIPBASE + 1e6, 6, 6, function() return 55 end)
+            for i, ax in ipairs({ sx + 1, sx + vw - 7 }) do
+                nodes[#nodes + 1] = { id = "arrow" .. i, t = "img", sc = "home",
+                    src = "&" .. (CHIPBASE + 1e6), iw = 6, ih = 6, v = 1,
+                    x = ax, y = r.y + 2, w = 6, h = 6 }
+            end
+        end
+    end
+    for _, extra in ipairs(opts.extra or {}) do nodes[#nodes + 1] = extra end
+    return nodes
+end
+
+local function carousels(n, iw, ih, pitch, y0, widths)
+    local rows = {}
+    for k = 1, n do
+        rows[k] = { iw = (widths and widths[k]) or iw, ih = ih,
+                    y = (y0 or 4) + (k - 1) * pitch, wy = (k - 1) * pitch }
+    end
+    return rows
+end
+
+-- Show `rows` at vertical offset `voff`, carousel k at `hoffs[k]`.
+local function show_stack(rows, opts, voff, hoffs)
+    scene(stack(rows, opts)); settle()
+    for k, off in pairs(hoffs or {}) do
+        if off ~= 0 then scroll_to("c" .. k, off) end
+    end
+    scroll_to("home", voff)
+end
+
+local stack_merged = 0
+local function compare_stack(rows, opts, voff, hoffs)
+    local plain = {}
+    for k, v in pairs(opts) do plain[k] = v end
+    plain.win = false
+    scene({}); settle()
+    show_stack(rows, plain, voff, hoffs)
+    local want = composite()
+    local wopts = {}
+    for k, v in pairs(opts) do wopts[k] = v end
+    wopts.win = true
+    scene({}); settle()
+    local mark = #fake.log.commands
+    show_stack(rows, wopts, voff, hoffs)
+    local got = composite()
+    local _, adds = adds_since(mark)
+    for _, c in ipairs(adds) do
+        if c[5]:sub(1, 1) == "&" and tonumber(c[5]:sub(2)) >= WINBASE then
+            stack_merged = stack_merged + 1
+            break
+        end
+    end
+    return same(want, got)
+end
+
+-- 6a. counts: one add per vertical frame with every carousel at rest; a
+-- paged carousel keeps its own overlay and splits the run around it.
+do
+    local rows = carousels(6, 400, 14, 22, 4)
+    local function per_frame(win, hoffs)
+        scene({}); settle()
+        show_stack(rows, { win = win }, 0, hoffs)
+        local per = {}
+        for step = 1, 4 do
+            local mark = #fake.log.commands
+            scroll_to("home", step * 3)
+            per[#per + 1] = (adds_since(mark))
+        end
+        return table.concat(per, ",")
+    end
+    ok(per_frame(true) == "1,1,1,1",
+       "stacked carousels at rest cost one overlay-add per vertical frame",
+       per_frame(true))
+    local plain = per_frame(false)
+    ok(plain ~= "1,1,1,1",
+       "without windows the same frames cost one add per carousel (" .. plain .. ")")
+    local paged = per_frame(true, { [3] = 40 })
+    local worst = 0
+    for n in paged:gmatch("%d+") do worst = math.max(worst, tonumber(n)) end
+    ok(worst >= 2 and worst <= 3,
+       "a carousel paged sideways keeps its own overlay; the rows either side "
+       .. "still merge (" .. paged .. ")")
+end
+
+-- 6b. pixels: deterministic cases.
+do
+    local cases = {
+        { "carousels at rest", carousels(6, 400, 14, 22, 4), {}, 9, nil },
+        { "a short carousel (narrower than the window)",
+          carousels(5, 400, 14, 22, 4, { [2] = 60 }), {}, 7, nil },
+        { "one carousel paged", carousels(6, 400, 14, 22, 4), {}, 9, { [3] = 40 } },
+        { "every carousel at a different offset", carousels(6, 400, 14, 22, 4),
+          {}, 9, { 0, 13, 0, 200, 1, 0 } },
+        { "two carousels paged identically", carousels(6, 400, 14, 22, 4),
+          {}, 9, { [2] = 30, [3] = 30 } },
+        { "a carousel paged just inside the copied columns",
+          carousels(5, 400, 14, 22, 4), {}, 3, { [2] = 2 } },
+        { "top and bottom partial rows", carousels(9, 400, 20, 27, 0), {}, 31.5, nil },
+        { "fractional vertical offset", carousels(7, 400, 14, 22, 4), {}, 9.25, nil },
+        { "a hover chip on a row", carousels(6, 400, 14, 22, 4), { chip = 2 }, 5, nil },
+        { "a chip on a paged row", carousels(6, 400, 14, 22, 4), { chip = 2 }, 5,
+          { [2] = 25 } },
+        { "overlay-mode page arrows", carousels(6, 400, 14, 22, 4), { arrows = 3 }, 5, nil },
+        { "a dialog over the middle", carousels(7, 400, 14, 22, 4),
+          { extra = { { id = "dlg", t = "layer", x = 40, y = 30, w = 60, h = 40 } } },
+          4, nil },
+        { "a full-width dialog across a row boundary", carousels(7, 400, 14, 22, 4),
+          { extra = { { id = "dlg", t = "layer", x = -10, y = 31, w = 200, h = 9 } } },
+          0, nil },
+        { "an occluder across the stack", carousels(7, 400, 14, 22, 4),
+          { extra = { { id = "oc", t = "occ", sc = "home", x = 0, y = 40, w = 160, h = 9 } } },
+          4, nil },
+        { "a clipped viewport", carousels(9, 400, 14, 22, 0),
+          { sx = 10, sy = 13.5, vw = 100, vh = 70 }, 17.5, { [4] = 33 } },
+        -- The one shape where only "same columns" (b.wsx == a.wsx) keeps two
+        -- rows apart: carousels barely wider than the view, scrolled to
+        -- the two last positions of their few-pixel range. Both start at
+        -- the clip's left edge, end at their own right edge, and stay
+        -- inside the copied columns -- one column apart.
+        { "two short carousels one column apart", carousels(4, 45, 14, 22, 4),
+          { vw = 50 }, 3, { [2] = 6, [3] = 7 } },
+    }
+    for _, c in ipairs(cases) do
+        local s, at = compare_stack(c[2], c[3], c[4], c[5])
+        ok(s, "stacked carousels, same pixels with and without windows: " .. c[1],
+           at and ("first difference at pixel " .. at))
+    end
+    ok(stack_merged >= 8, "and those cases did merge (" .. stack_merged .. ")")
+end
+
+-- 6c. a carousel moving sideways while the page scrolls vertically: every
+-- frame of the interleaved sequence draws what the rows draw on their own.
+do
+    local rows = carousels(7, 400, 14, 22, 4)
+    local steps = { { "home", 3 }, { "c2", 10 }, { "home", 7 }, { "c2", 35 },
+                    { "home", 11.5 }, { "c4", 60 }, { "home", 16 }, { "c2", 0 },
+                    { "home", 20 }, { "c4", 0 }, { "home", 24 } }
+    local function run(win)
+        scene({}); settle()
+        scene(stack(rows, { win = win })); settle()
+        local frames = {}
+        for _, s in ipairs(steps) do
+            scroll_to(s[1], s[2])
+            frames[#frames + 1] = composite()
+        end
+        return frames
+    end
+    local a, b = run(false), run(true)
+    local bad
+    for i = 1, #steps do
+        local s, at = same(a[i], b[i])
+        if not s then bad = bad or ("step " .. i .. " at pixel " .. tostring(at)) end
+    end
+    ok(bad == nil, "a carousel paged during vertical scrolling: every frame matches", bad)
+end
+
+-- 6d. random sweep over geometry, vertical and per-carousel offsets, chips,
+-- arrows, dialogs and occluders.
+do
+    math.randomseed(5151)
+    local fr = { 0, 0.5, 0.25, 0.75 }
+    local bad, first
+    stack_merged = 0
+    local reads0 = bad_reads
+    for trial = 1, 200 do
+        local n = math.random(2, 7)
+        local ih = math.random(4, 18)
+        local pitch = ih + math.random(1, 9)            -- heading in the gap
+        local iw = math.random(30, 420)
+        local widths = {}
+        if math.random() < 0.3 then widths[math.random(1, n)] = math.random(10, 120) end
+        local rows = carousels(n, iw, ih, pitch, math.random(-10, 20), widths)
+        local opts = { sx = math.random(0, 6), sy = math.random(0, 6) + fr[math.random(#fr)],
+                       vw = math.random(60, SW), vh = math.random(30, SH) }
+        local r = math.random()
+        if r < 0.15 then
+            opts.chip = math.random(1, n); opts.chip_dy = math.random(-4, ih)
+        elseif r < 0.25 then
+            opts.arrows = math.random(1, n)
+        elseif r < 0.4 then
+            opts.extra = { { id = "pop", t = "layer", x = math.random(0, 120),
+                y = math.random(0, 100), w = math.random(5, 60), h = math.random(3, 40) } }
+        elseif r < 0.5 then
+            opts.extra = { { id = "oc", t = "occ", sc = "home", x = math.random(0, 120),
+                y = math.random(0, 100) + fr[math.random(#fr)],
+                w = math.random(5, 160), h = math.random(2, 30) } }
+        end
+        local hoffs = {}
+        for k = 1, n do
+            if math.random() < 0.35 then hoffs[k] = math.random(0, 300) end
+        end
+        local voff = math.random(0, 80) + fr[math.random(#fr)]
+        local s, at = compare_stack(rows, opts, voff, hoffs)
+        if not s then
+            bad = (bad or 0) + 1
+            first = first or string.format("trial %d n=%d ih=%d pitch=%d iw=%d voff=%s at %s",
+                trial, n, ih, pitch, iw, tostring(voff), tostring(at))
+        end
+    end
+    ok(bad == nil, "stacked-carousel sweep: every windowed frame matches the per-row picture",
+       first)
+    ok(stack_merged > 60, "and the sweep exercised merging (" .. stack_merged .. " frames)")
+    ok(bad_reads == reads0, "no stacked overlay ever read outside one bitmap ("
+       .. (bad_reads - reads0) .. ")")
+end
+
+-- 6e. input: hit-testing and hover over stacked carousels are the same with
+-- and without the window.
+do
+    local function events_for(win)
+        local rows = carousels(5, 400, 14, 22, 4)
+        scene({}); settle()
+        show_stack(rows, { win = win }, 6, { [2] = 20 })
+        fake.reset_events()
+        for _, p in ipairs({ { 10, 5 }, { 10, 30 }, { 12, 47 }, { 90, 30 } }) do
+            fake.observe("mouse-pos", { x = p[1], y = p[2], hover = true })
+            settle()
+            fake.key("mbtn_left")
+            settle()
+        end
+        local out = {}
+        for _, e in ipairs(fake.log.events) do
+            if type(e) == "table" then
+                out[#out + 1] = tostring(e.t) .. ":" .. tostring(e.id)
+            end
+        end
+        return table.concat(out, " ")
+    end
+    local a, b = events_for(false), events_for(true)
+    ok(a == b and #a > 0, "stacked carousels: clicks and hover resolve the same nodes",
+       "\n  plain:    " .. a .. "\n  windowed: " .. b)
+end
+
+-- ============================================================ 8. mixed widths
+-- Real carousels are not one width: a row narrower than the view is laid out
+-- only as wide as its content (Run D: requiring one width refused every real
+-- Home page). Each row's copy is what ITS viewport shows, so nothing its clip
+-- hides is in the window, and the picture is the per-row one.
+do
+    -- a short My Media row first, then posters, a short section, posters
+    local function home()
+        local rows = carousels(6, 400, 14, 22, 4, { [1] = 70, [4] = 40 })
+        return rows
+    end
+    local function per_frame(opts, hoffs)
+        scene({}); settle()
+        show_stack(home(), opts, 0, hoffs)
+        local per = {}
+        for step = 1, 4 do
+            local mark = #fake.log.commands
+            scroll_to("home", step * 3)
+            per[#per + 1] = (adds_since(mark))
+        end
+        return table.concat(per, ",")
+    end
+    local merged = per_frame({ win = true, fit = true })
+    local plain = per_frame({ win = false, fit = true })
+    ok(merged == "1,1,1,1",
+       "mixed-width carousels at rest cost one overlay-add per vertical frame ("
+       .. merged .. "; without windows " .. plain .. ")")
+
+    local narrow = carousels(5, 400, 14, 22, 4)
+    narrow[3].view = 60                 -- a strip wider than a narrower view
+    local cases = {
+        { "at rest", home(), { fit = true }, 9 },
+        { "a short row in the middle, partial rows", home(), { fit = true }, 31.5 },
+        { "a strip wider than its own narrower viewport", narrow, {}, 5 },
+        { "that row paged inside its narrow viewport", narrow, {}, 5, { [3] = 30 } },
+        { "a poster row paged", home(), { fit = true }, 9, { [2] = 40 } },
+        { "a chip on the short row", home(), { fit = true, chip = 1 }, 0 },
+        { "a chip on a poster row", home(), { fit = true, chip = 2 }, 5 },
+        { "overlay arrows on a poster row", home(), { fit = true, arrows = 3 }, 5 },
+        { "a dialog over the stack", home(),
+          { fit = true, extra = { { id = "dlg", t = "layer", x = 30, y = 20, w = 70, h = 50 } } }, 4 },
+        { "a full-width dialog across a row boundary", home(),
+          { fit = true, extra = { { id = "dlg", t = "layer", x = -10, y = 31, w = 200, h = 9 } } }, 0 },
+        { "a clipped page", home(), { fit = true, sx = 10, sy = 13.5, vw = 100, vh = 70 }, 17.5 },
+    }
+    for _, c in ipairs(cases) do
+        local s, at = compare_stack(c[2], c[3], c[4], c[5])
+        ok(s, "mixed-width carousels, same pixels with and without windows: " .. c[1],
+           at and ("first difference at pixel " .. at))
+    end
+
+    math.randomseed(7272)
+    local bad, first
+    local reads0, merged0 = bad_reads, stack_merged
+    for trial = 1, 200 do
+        local n = math.random(2, 7)
+        local ih = math.random(4, 18)
+        local widths = {}
+        for k = 1, n do
+            if math.random() < 0.4 then widths[k] = math.random(10, 140) end
+        end
+        local rws = carousels(n, math.random(30, 420), ih, ih + math.random(1, 9),
+                              math.random(-10, 20), widths)
+        local opts = { fit = true, sx = math.random(0, 6),
+                       sy = math.random(0, 6) + 0.5 * math.random(0, 1),
+                       vw = math.random(60, SW), vh = math.random(30, SH) }
+        for k = 1, n do
+            if math.random() < 0.15 then rws[k].view = math.random(20, opts.vw) end
+        end
+        local hoffs = {}
+        for k = 1, n do
+            if math.random() < 0.25 then hoffs[k] = math.random(0, 300) end
+        end
+        local r = math.random()
+        if r < 0.15 then opts.chip = math.random(1, n)
+        elseif r < 0.25 then opts.arrows = math.random(1, n)
+        elseif r < 0.4 then
+            opts.extra = { { id = "pop", t = "layer", x = math.random(0, 120),
+                y = math.random(0, 100), w = math.random(5, 60), h = math.random(3, 40) } }
+        end
+        local s, at = compare_stack(rws, opts, math.random(0, 80) + 0.25 * math.random(0, 3), hoffs)
+        if not s then
+            bad = (bad or 0) + 1
+            first = first or string.format("trial %d n=%d at %s", trial, n, tostring(at))
+        end
+    end
+    ok(bad == nil, "mixed-width sweep: every windowed frame matches the per-row picture", first)
+    ok(stack_merged - merged0 > 60, "and the sweep exercised merging ("
+       .. (stack_merged - merged0) .. " frames)")
+    ok(bad_reads == reads0, "and nothing read outside one bitmap ("
+       .. (bad_reads - reads0) .. ")")
+end
+
 print("1.." .. n_tests)
 os.exit(failed == 0 and 0 or 1)

@@ -35,7 +35,7 @@ from jellyfin_mpv_shim.mpvtk.app import MpvtkApp
 from jellyfin_mpv_shim.mpvtk.layout import layout
 from jellyfin_mpv_shim.mpvtk.rawimage import MemoryStore
 from jellyfin_mpv_shim.mpvtk.widgets import Column, ImageMap
-from jellyfin_mpv_shim.mpvtk_browser.strips import StripStore
+from jellyfin_mpv_shim.mpvtk_browser.strips import SiblingWindow, StripStore
 from jellyfin_mpv_shim.mpvtk_browser.tile_renderer import TileRenderer
 from tests.integration._harness import FakeMPV
 
@@ -394,6 +394,323 @@ class TestPlumbing(unittest.TestCase):
         for n in range(40):
             TileRenderer.overlay_window_rows(fake, (1000, 1080), geom, "s%d" % n)
         self.assertLessEqual(len(fake._overlay_windows), 16)
+
+
+class _Stack:
+    """A store plus a Home-page-looking scene: carousel strips, each in its
+    own horizontal scroll, stacked in one vertical scroll ("home")."""
+
+    VIEW_W = 100.0      # the carousels' viewport, physical
+    LEAD = 16.0         # the strip's inset inside it (ROW_LEAD)
+
+    def __init__(self, test, mem=True, rows=4, iw=240, ih=20, pitch=37,
+                 y0=117.0, widths=None):
+        self.tmp = None
+        if mem:
+            self.store = StripStore(mem_store=MemoryStore())
+        else:
+            self.tmp = tempfile.mkdtemp(prefix="mpvtk-win-")
+            test.addCleanup(shutil.rmtree, self.tmp, True)
+            self.store = StripStore(cache_dir=self.tmp)
+        test.addCleanup(self.store.shutdown)
+        self.ih, self.pitch, self.y0 = ih, pitch, y0
+        self.entries = []
+        for k in range(rows):
+            w = (widths or {}).get(k, iw)
+            self.entries.append(self.store.bitmap(("car", k),
+                                                  _image(w, ih, k + 3)))
+
+    def nodes(self, wg=None, over=None, scroll_over=None):
+        wg = SiblingWindow("home#win") if wg is None else wg
+        out = [{"t": "scroll", "id": "home", "axis": "y", "x": 0.0,
+                "y": 60.0, "w": 120.0, "h": 400.0}]
+        for k, e in enumerate(self.entries):
+            y = self.y0 + k * self.pitch
+            sc = {"t": "scroll", "id": "row-%d" % k, "axis": "x",
+                  "sc": "home", "x": 0.0, "y": y - 5, "w": self.VIEW_W,
+                  "h": float(self.ih + 10)}
+            sc.update((scroll_over or {}).get(k, {}))
+            out.append(sc)
+            n = {"t": "img", "id": "row-%d#strip" % k, "sc": "row-%d" % k,
+                 "src": e["src"], "iw": e["iw"], "ih": e["ih"], "v": e["v"],
+                 "x": self.LEAD, "y": y, "w": float(e["iw"]),
+                 "h": float(e["ih"]), "wg": wg}
+            n.update((over or {}).get(k, {}))
+            out.append(n)
+        return out
+
+    @staticmethod
+    def strips(nodes):
+        return [n for n in nodes if n.get("t") == "img"]
+
+    def buf(self, src):
+        return self.store.mem._bufs.get(src)
+
+
+class TestSiblingCarouselWindows(unittest.TestCase):
+    """SiblingWindow: the Home page's stacked carousels share one window."""
+
+    def test_sibling_carousels_share_a_viewport_wide_window(self):
+        st = _Stack(self, widths={2: 50})          # row 2 is a short carousel
+        nodes = st.nodes()
+        st.store.build_windows(nodes)
+        strips = st.strips(nodes)
+        wins = [n["win"] for n in strips]
+        self.assertEqual(len({w["src"] for w in wins}), 1, "one window")
+        w0 = wins[0]
+        # What a carousel at rest shows of its strip, plus a rounding line:
+        # not the 240 columns of the strip.
+        ww = int(_Stack.VIEW_W - _Stack.LEAD) + 1
+        self.assertEqual(w0["w"], ww)
+        self.assertEqual(w0["h"], 3 * st.pitch + st.ih)
+        self.assertEqual([w["y"] for w in wins],
+                         [k * st.pitch for k in range(4)])
+        self.assertEqual({w["g"] for w in wins}, {"home#win"})
+        self.assertIs(type(w0["g"]), str, "a plain string for the renderer")
+        self.assertTrue(all("wg" not in n for n in nodes))
+        win = bytes(st.buf(w0["src"]))
+        self.assertEqual(len(win), ww * w0["h"] * 4)
+        stride = ww * 4
+        for k, e in enumerate(st.entries):
+            src = bytes(st.buf(e["src"]))
+            line = e["iw"] * 4
+            copy = min(e["iw"], ww) * 4
+            for y in range(e["ih"]):
+                at = (wins[k]["y"] + y) * stride
+                self.assertEqual(win[at:at + copy],
+                                 src[y * line:y * line + copy],
+                                 "row %d line %d: its leading columns" % (k, y))
+                self.assertEqual(win[at + copy:at + stride],
+                                 bytes(stride - copy),
+                                 "row %d line %d: transparent past it" % (k, y))
+            if k + 1 < len(st.entries):
+                g0 = (wins[k]["y"] + e["ih"]) * stride
+                g1 = wins[k + 1]["y"] * stride
+                self.assertEqual(win[g0:g1], bytes(g1 - g0),
+                                 "the gap (the next heading) is transparent")
+
+    def test_carousels_of_different_widths_share_a_window(self):
+        """Run D: a carousel narrower than the window is laid out only as
+        wide as its content (My Media with three libraries), and requiring
+        one width refused every real Home page. Widths may differ; each row
+        copies what ITS viewport shows, and the rest of its lines are
+        transparent."""
+        st = _Stack(self, rows=4, iw=240, widths={1: 50, 3: 70})
+        # row 1: a short row, its container hugging its content; row 3: a
+        # strip wider than a container that is narrower than the others
+        scroll_over = {1: {"w": 50 + 2 * _Stack.LEAD}, 3: {"w": 60.0}}
+        nodes = st.nodes(scroll_over=scroll_over)
+        st.store.build_windows(nodes)
+        strips = st.strips(nodes)
+        self.assertTrue(all("win" in n for n in strips))
+        wins = [n["win"] for n in strips]
+        self.assertEqual(len({w["src"] for w in wins}), 1)
+        views = [_Stack.VIEW_W, 50 + 2 * _Stack.LEAD, _Stack.VIEW_W, 60.0]
+        copies = [min(e["iw"], int(v - _Stack.LEAD) + 1)
+                  for e, v in zip(st.entries, views)]
+        self.assertEqual(copies, [85, 50, 85, 45])
+        ww = wins[0]["w"]
+        self.assertEqual(ww, max(copies))
+        win = bytes(st.buf(wins[0]["src"]))
+        stride = ww * 4
+        for k, e in enumerate(st.entries):
+            src = bytes(st.buf(e["src"]))
+            line, copy = e["iw"] * 4, copies[k] * 4
+            for y in range(e["ih"]):
+                at = (wins[k]["y"] + y) * stride
+                self.assertEqual(win[at:at + copy],
+                                 src[y * line:y * line + copy],
+                                 "row %d line %d: what its viewport shows" % (k, y))
+                self.assertEqual(win[at + copy:at + stride],
+                                 bytes(stride - copy),
+                                 "row %d line %d: nothing its clip hides" % (k, y))
+
+    def test_a_member_wider_than_the_window_is_copied_within_its_bounds(self):
+        st = _Stack(self, rows=2, iw=240, ih=7)
+        e0, e1 = st.entries
+        entry = st.store.window([(e0["src"], e0["v"], 240, 7, 0),
+                                 (e1["src"], e1["v"], 240, 7, 9)], 33, 16)
+        self.assertIsNotNone(entry)
+        win = bytes(st.buf(entry["src"]))
+        self.assertEqual(len(win), 33 * 16 * 4)
+        for wy, e in ((0, e0), (9, e1)):
+            src = bytes(st.buf(e["src"]))
+            for y in range(7):
+                self.assertEqual(win[(wy + y) * 132:(wy + y + 1) * 132],
+                                 src[y * 960:y * 960 + 132])
+
+    def test_only_an_opted_in_group_may_span_containers(self):
+        st = _Stack(self)
+        nodes = st.nodes(wg="home#win")          # a plain (grid) group
+        st.store.build_windows(nodes)
+        self.assertFalse(any("win" in n for n in nodes),
+                         "a grid group still needs one container")
+        self.assertTrue(all("wg" not in n for n in nodes))
+
+    def test_sibling_structure_that_is_not_provable_is_left_alone(self):
+        st = _Stack(self)
+        cases = {
+            "a row not in a horizontal scroll": dict(
+                scroll_over={1: {"axis": "y"}}),
+            "rows under different outer scrolls": dict(
+                scroll_over={2: {"sc": "elsewhere"}}),
+            "a carousel at another x (left edge)": dict(
+                scroll_over={1: {"x": 4.0}}),
+            "a strip at another x": dict(over={1: {"x": 17.0}}),
+            "a container the scene does not have": dict(
+                over={2: {"sc": "missing"}}),
+            "fractional spacing": dict(over={2: {"y": 117.0 + 74.5}}),
+            "overlapping rows": dict(over={1: {"y": 117.0 + 5}}),
+            "a scaled strip": dict(over={1: {"dw": 300}}),
+            "a file-backed strip": dict(over={1: {"src": "/tmp/x.bgra"}}),
+        }
+        for name, kw in cases.items():
+            with self.subTest(name):
+                nodes = st.nodes(**kw)
+                st.store.build_windows(nodes)
+                self.assertFalse(any("win" in n for n in nodes))
+                self.assertTrue(all("wg" not in n for n in nodes))
+
+    def test_jsonipc_gets_no_window_and_loses_the_markers(self):
+        st = _Stack(self, mem=False)
+        nodes = st.nodes()
+        before = [dict(n) for n in nodes]
+        st.store.build_windows(nodes)
+        for b, n in zip(before, nodes):
+            b.pop("wg", None)
+            self.assertEqual(n, b, "the scene is otherwise untouched")
+
+    def test_artwork_arrival_makes_a_new_window_and_the_old_one_is_intact(self):
+        st = _Stack(self)
+        first = st.nodes()
+        st.store.build_windows(first)
+        old = st.strips(first)[0]["win"]
+        old_bytes = bytes(st.buf(old["src"]))
+        st.entries[2] = st.store.bitmap(("car", 2, "poster"),
+                                        _image(240, 20, 77))
+        second = st.nodes()
+        st.store.build_windows(second)
+        new = st.strips(second)[0]["win"]
+        self.assertNotEqual((new["src"], new["v"]), (old["src"], old["v"]))
+        self.assertEqual(bytes(st.buf(old["src"])), old_bytes,
+                         "a published window is never written again")
+        stride = new["w"] * 4
+        at = st.strips(second)[2]["win"]["y"] * stride
+        src = bytes(st.buf(st.entries[2]["src"]))
+        self.assertEqual(bytes(st.buf(new["src"]))[at:at + new["w"] * 4],
+                         src[:new["w"] * 4])
+
+    def test_the_cap_counts_the_copied_width_not_the_strip(self):
+        st = _Stack(self, rows=4, iw=2000)
+        s = st.store
+        ww = int(_Stack.VIEW_W - _Stack.LEAD) + 1
+        need = ww * 4 * (3 * st.pitch + st.ih)
+        s.WINDOW_MAX_BYTES = need       # all four, at the copied width
+        nodes = st.nodes()
+        s.build_windows(nodes)
+        self.assertTrue(all("win" in n for n in st.strips(nodes)),
+                        "2000-column strips, but only %d are copied" % ww)
+        w = st.strips(nodes)[0]["win"]
+        self.assertLessEqual(w["w"] * w["h"] * 4, s.WINDOW_MAX_BYTES)
+
+    def test_a_sibling_group_over_the_cap_is_refused_not_trimmed(self):
+        """A grid group is trimmed to the rows that fit; a sibling group is
+        not: a window holding some of the carousels on screen was slower
+        than none (4K, measured). Every row then draws on its own."""
+        st = _Stack(self, rows=6, iw=2000)
+        s = st.store
+        ww = int(_Stack.VIEW_W - _Stack.LEAD) + 1
+        s.WINDOW_MAX_BYTES = ww * 4 * (2 * st.pitch + st.ih)   # three of six
+        nodes = st.nodes()
+        before = len(s.mem._bufs)
+        s.build_windows(nodes)
+        self.assertFalse(any("win" in n for n in st.strips(nodes)))
+        self.assertTrue(all("wg" not in n for n in nodes))
+        self.assertEqual(len(s.mem._bufs), before, "nothing was copied")
+
+    def test_a_row_left_out_leaves_transparent_lines_between_members(self):
+        """A carousel paged sideways is not marked (TileRenderer), so its
+        neighbours form a group with a gap: the window spans it, and the
+        lines where it sits are transparent for the renderer to draw the
+        row itself on top -- the rows either side still one rectangle."""
+        st = _Stack(self, rows=4)
+        nodes = st.nodes()
+        strips = st.strips(nodes)
+        strips[1].pop("wg")                     # row 1 is paged: left out
+        st.store.build_windows(nodes)
+        self.assertNotIn("win", strips[1])
+        wins = [strips[k]["win"] for k in (0, 2, 3)]
+        self.assertEqual([w["i"] for w in wins], [0, 1, 2],
+                         "consecutive in the window, so they merge")
+        self.assertEqual([w["y"] for w in wins],
+                         [0, 2 * st.pitch, 3 * st.pitch],
+                         "but on their real lines")
+        w0 = wins[0]
+        win = bytes(st.buf(w0["src"]))
+        stride = w0["w"] * 4
+        gap0, gap1 = st.ih * stride, 2 * st.pitch * stride
+        self.assertEqual(win[gap0:gap1], bytes(gap1 - gap0),
+                         "the paged row's lines are transparent")
+
+    def test_windows_age_out_like_any_other(self):
+        st = _Stack(self)
+        s = st.store
+        nodes = st.nodes()
+        s.build_windows(nodes)
+        src = st.strips(nodes)[0]["win"]["src"]
+        for _ in range(s.PROTECT_GENERATIONS):
+            s.on_scene_pushed()
+            self.assertIn(src, s.mem._bufs)
+        s.on_scene_pushed()
+        self.assertNotIn(src, s.mem._bufs)
+
+    def test_display_scales_merge_only_on_whole_line_spacing(self):
+        """A Home-like tree through the real layout and scaling. Wherever
+        the rows land a fractional number of lines apart the group is
+        refused, and the scene is the one the rows would have drawn
+        anyway -- correct, just not merged."""
+        from jellyfin_mpv_shim.mpvtk.widgets import Box, HScroll, Spacer, VScroll
+
+        results = {}
+        for scale in (1.0, 1.25, 1.5, 1.75, 2.0):
+            scaling.set_scale(scale)
+            try:
+                store = StripStore(mem_store=MemoryStore())
+                self.addCleanup(store.shutdown)
+                lw, lh = 300, 271
+                iw, ih = scaling.px(lw), scaling.px(lh)
+                blocks = []
+                for k in range(3):
+                    e = store.bitmap(("scale", scale, k), _image(iw, ih, k))
+                    strip = ImageMap(e["src"], iw, ih, w=lw, h=lh,
+                                     id="row-%d#strip" % k, v=e["v"],
+                                     win=SiblingWindow("home#win"))
+                    blocks.append(Column([
+                        Spacer(h=30),       # the section heading
+                        HScroll(Box([strip], pad=(16, 5)), id="row-%d" % k,
+                                h=lh + 10, flex=1),
+                    ], gap=4))
+                tree = VScroll(Column(blocks, gap=20, pad=(0, 16)), id="home",
+                               flex=1)
+                nodes, _ = layout(Column([tree], w=200, h=600), 200, 600)
+                scaling.scale_scene(nodes)
+                strips = [n for n in nodes if n.get("t") == "img"]
+                ys = [float(n["y"]) for n in strips]
+                whole = all(abs((y - ys[0]) - round(y - ys[0])) < 1e-6
+                            for y in ys)
+                plain = [dict(n) for n in nodes]
+                store.build_windows(nodes)
+                merged = all("win" in n for n in strips)
+                results[scale] = merged
+                self.assertEqual(merged, whole, "scale %s" % scale)
+                if not merged:
+                    for b, n in zip(plain, nodes):
+                        b.pop("wg", None)
+                        self.assertEqual(n, b, "scale %s: untouched" % scale)
+            finally:
+                scaling.set_scale(1.0)
+        self.assertTrue(results[1.0] and results[2.0],
+                        "whole scales merge: %s" % results)
 
 
 if __name__ == "__main__":

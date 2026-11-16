@@ -25,6 +25,7 @@ See docs/artwork-pipeline.md for shapes, plating and the cache policy.
 
 import dataclasses
 import logging
+import math
 import os
 import threading
 from collections import OrderedDict
@@ -36,6 +37,29 @@ from ..mpvtk.rawimage import write_bgra
 from . import theme
 
 log = logging.getLogger("mpvtk_browser.strips")
+
+
+class SiblingWindow(str):
+    """A combined-window group name (``ImageMap.win``) that opts in to rows
+    in SIBLING horizontal scrolls: the Home page's carousels, each its own
+    HScroll, stacked in one vertical scroll.
+
+    A plain string is the grid's group -- rows in ONE container -- and is
+    checked exactly as before. This one is accepted across containers only
+    when StripStore._window_group can see the structure that makes it safe:
+    every row's container is a horizontal scroll directly inside the same
+    vertical one, all with one left edge (their widths may differ: see
+    _sibling_copies). Each carousel still scrolls on its own; renderer.lua
+    merges a frame's crops only where they provably show the same picture
+    (same screen x, same columns, consecutive rows), so a carousel paged
+    sideways simply keeps its own overlay.
+
+    A ``str`` so it can travel as the group name everywhere a grid's does
+    (layout's ``wg``, the renderer's ``g``) without anything else changing.
+    """
+
+    __slots__ = ()
+
 
 def _px(v):
     """Logical -> physical, for constants baked into a strip bitmap."""
@@ -744,6 +768,18 @@ class StripStore:
         which is what lets the renderer draw those pixels without changing
         the picture.
 
+        A member WIDER than the window contributes only its first ``ww``
+        columns, read line by line within its own ``iw * ih * 4`` bytes: a
+        carousel strip is many screens wide and only its leading viewport
+        is worth copying. Its other columns are simply not in the window;
+        renderer.lua bounds every merged crop by the window's width, so a
+        crop that reaches past them is drawn from the strip itself.
+
+        A member may carry a sixth field, its own copy width: only its
+        first that-many columns are copied and the rest of its lines stay
+        transparent. A carousel copies what ITS viewport shows, so the
+        window never holds a pixel that row's own clip would hide.
+
         **Immutable.** The buffer is filled completely before it gets a src,
         and is never written again: a poster arriving recomposites its row
         under a new src and v, which is a new key and so a new window. The
@@ -755,8 +791,10 @@ class StripStore:
         """
         if self.mem is None or len(members) < 2 or ww < 1 or wh < 1:
             return None
-        members = tuple((str(s), int(v), int(iw), int(ih), int(wy))
-                        for s, v, iw, ih, wy in members)
+        members = tuple(
+            (str(m[0]), int(m[1]), int(m[2]), int(m[3]), int(m[4]),
+             int(m[5]) if len(m) > 5 else int(m[2]))
+            for m in members)
         # v is in the key for the reason _store gives: addresses recycle,
         # and a recycled member src must not find the old window.
         key = ("window", int(ww), int(wh), members)
@@ -774,19 +812,22 @@ class StripStore:
         base = ctypes.addressof(buf)
         with self._lock:
             # Under the lock: nothing may free a member while it is read.
-            for src, _v, iw, ih, wy in members:
+            for src, _v, iw, ih, wy, cw in members:
                 sbuf = self.mem._bufs.get(src)
-                if (sbuf is None or len(sbuf) != iw * ih * 4 or iw > ww
-                        or wy < 0 or wy + ih > wh):
+                if (sbuf is None or len(sbuf) != iw * ih * 4
+                        or wy < 0 or wy + ih > wh or cw < 1):
                     return None
                 saddr = ctypes.addressof(sbuf)
-                if iw == ww:
+                if iw == ww and cw >= iw:
                     ctypes.memmove(base + wy * row, saddr, iw * ih * 4)
                 else:
-                    line = iw * 4
+                    # Line by line: the source stride is iw, the window's
+                    # ww, and a member gives only its first min(cw, iw, ww)
+                    # columns -- never past either buffer.
+                    line, copy = iw * 4, min(iw, ww, cw) * 4
                     for y in range(ih):
                         ctypes.memmove(base + (wy + y) * row,
-                                       saddr + y * line, line)
+                                       saddr + y * line, copy)
             hit = self._cache.get(key)
             if hit is not None:
                 self._touch(key)
@@ -809,6 +850,8 @@ class StripStore:
         Anything this cannot prove lines up is left alone, and renders as
         it always has: rows in different containers or columns, a
         fractional y, overlapping rows, a scaled or file-backed image.
+        A :class:`SiblingWindow` group (the Home page's carousels) may span
+        containers, under the conditions that class gives.
         """
         groups: dict[object, list[dict]] = {}
         for node in nodes:
@@ -817,15 +860,64 @@ class StripStore:
                 groups.setdefault(g, []).append(node)
         if self.mem is None:
             return
+        scrolls = None
+        if any(isinstance(g, SiblingWindow) for g in groups):
+            scrolls = {n.get("id"): n for n in nodes if n.get("t") == "scroll"}
         for g, rows in groups.items():
             try:
-                self._window_group(g, rows)
+                self._window_group(g, rows, scrolls)
             except Exception:
                 log.debug("scroll window %s skipped", g, exc_info=True)
 
-    def _window_group(self, g, rows):
+    @staticmethod
+    def _sibling_copies(rows, scrolls):
+        """Each row's copy width for a SiblingWindow group, or None if its
+        rows are not provably sibling carousels.
+
+        Each row's container must be a horizontal scroll whose parent is the
+        same vertical scroll, all with one left edge (the rows' own common
+        x is checked by the caller). Their WIDTHS may differ: a carousel
+        narrower than the window -- My Media with a few libraries, a section
+        with three items -- is laid out only as wide as its content, and
+        requiring one width refused every real Home page (Run D). A row's
+        copy is what its own viewport shows of its strip: from the strip's
+        left edge to that viewport's right, plus a line for rounding, and
+        never more than the strip. So the copy is a screenful, not a strip
+        of fifty posters, and nothing a row's clip hides is in the window.
+        renderer.lua still merges only crops that provably line up (same
+        screen x and columns; a narrower crop only where it ends at its own
+        image's edge). Physical, like everything here."""
+        if not scrolls:
+            return None
+        outer = cx = None
+        copies = []
+        for n in rows:
+            c = scrolls.get(n.get("sc"))
+            if c is None or c.get("axis") != "x":
+                return None
+            o = scrolls.get(c.get("sc"))
+            if o is None or o.get("axis") != "y":
+                return None
+            if outer is None:
+                outer, cx = o.get("id"), c.get("x")
+            elif (o.get("id"), c.get("x")) != (outer, cx):
+                return None
+            lead = float(n["x"]) - float(c["x"])
+            visible = int(math.ceil(float(c["w"]) - lead)) + 1
+            if visible < 1:
+                return None
+            copies.append(min(int(n["iw"]), visible))
+        return copies
+
+    def _window_group(self, g, rows, scrolls=None):
         if len(rows) < 2:
             return
+        sibling = isinstance(g, SiblingWindow)
+        copies = None
+        if sibling:
+            copies = self._sibling_copies(rows, scrolls)
+            if copies is None:
+                return
         sc, x = rows[0].get("sc"), rows[0].get("x")
         # Lines relative to the first row. They must be whole: the renderer
         # floors every row's position against the same scroll offset, so
@@ -839,7 +931,8 @@ class StripStore:
             src = n.get("src")
             if (n.get("t") != "img" or not isinstance(src, str)
                     or not src.startswith("&") or "dw" in n or "dh" in n
-                    or "base" in n or n.get("sc") != sc or n.get("x") != x):
+                    or "base" in n or n.get("x") != x
+                    or (n.get("sc") != sc and not sibling)):
                 return
             dy = float(n["y"]) - y0
             if abs(dy - round(dy)) > 1e-6:
@@ -853,9 +946,19 @@ class StripStore:
         lo, hi = 0, len(rows) - 1
         cap = self.window_cap()
 
-        def size(a, b):
-            return max(iws[a:b + 1]) * (ys[b] - ys[a] + ihs[b]) * 4
+        def width(a, b):
+            return max((copies or iws)[a:b + 1])
 
+        def size(a, b):
+            return width(a, b) * (ys[b] - ys[a] + ihs[b]) * 4
+
+        if sibling and size(lo, hi) > cap:
+            # Never trimmed: a window holding only some of the carousels on
+            # screen still costs several overlay-adds a frame and pushes
+            # mpv's atlas a size up -- slower than no window (measured at
+            # 4K). TileRenderer._mark_window sizes the group to fit; if it
+            # does not, every row draws on its own, as before.
+            return
         # The marked rows are centred on the viewport, so trim both ends
         # alternately to keep what is on screen.
         drop_end = True
@@ -867,17 +970,19 @@ class StripStore:
             drop_end = not drop_end
         if hi <= lo:
             return
-        ww = max(iws[lo:hi + 1])
+        ww = width(lo, hi)
         wh = ys[hi] - ys[lo] + ihs[hi]
         members = [(rows[k]["src"], int(rows[k].get("v", 0)), iws[k], ihs[k],
-                    ys[k] - ys[lo]) for k in range(lo, hi + 1)]
+                    ys[k] - ys[lo])
+                   + ((copies[k],) if copies is not None else ())
+                   for k in range(lo, hi + 1)]
         entry = self.window(members, ww, wh)
         if entry is None:
             return
         for i, k in enumerate(range(lo, hi + 1)):
             rows[k]["win"] = {"src": entry["src"], "w": ww, "h": wh,
                               "y": ys[k] - ys[lo], "i": i,
-                              "v": entry["v"], "g": g}
+                              "v": entry["v"], "g": str(g)}
 
     def clear(self):
         """Drop every cached bitmap and release its backing buffer.
