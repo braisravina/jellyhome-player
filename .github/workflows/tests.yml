@@ -34,7 +34,15 @@ jobs:
       # process in the job (workers, mpv, Xvfb, the mypy gate), swap included
       # -- the same 3 GiB that tools/limited_run.sh gives a local run. Checked,
       # not assumed, in "Check the memory ceiling" below.
-      options: --memory=3g --memory-swap=3g
+      #
+      # --init: Docker's init as PID 1, so orphaned processes are reaped as
+      # they are on any real system. Without it PID 1 is the runner's
+      # placeholder command, which never waits on anything: an orphan that
+      # exits stays a zombie, `kill(-pgid, 0)` still finds its group, and the
+      # integration runner's leak probe reports a leak that is not there
+      # (run 43846807449, tests/test_integration_runner.py). The probe is
+      # right; the host was wrong.
+      options: --init --memory=3g --memory-swap=3g
     env:
       LANG: C.UTF-8
       PYTHONUNBUFFERED: "1"

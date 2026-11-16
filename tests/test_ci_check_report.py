@@ -248,10 +248,24 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertEqual(_requirements.parse(m.group(1)),
                          frozenset(_requirements.KNOWN))
 
+    def _container_options(self):
+        m = re.search(r"^\s+options:\s*(.+)$", self.wf, re.M)
+        self.assertIsNotNone(m, "tests.yml gives the container no options")
+        return m.group(1).split()
+
     def test_the_job_is_bounded(self):
-        self.assertRegex(self.wf, r"options:\s*--memory=3g --memory-swap=3g")
+        opts = self._container_options()
+        self.assertIn("--memory=3g", opts)
+        self.assertIn("--memory-swap=3g", opts)
         self.assertRegex(self.wf, r"linux-full-tests:\n(?:.*\n){0,6}?\s+timeout-minutes: \d+")
         self.assertRegex(self.wf, r"Run the full suite\n\s+timeout-minutes: \d+")
+
+    def test_the_container_reaps_orphans(self):
+        """--init: without an init that reaps, an orphan that exits stays a
+        zombie, its process group still answers kill(-pgid, 0), and the
+        integration runner's leak probe fails on a leak that is not there
+        (CI run 43846807449). The fix belongs to the host, not the probe."""
+        self.assertIn("--init", self._container_options())
 
     def test_debian_13_python_3_13_and_the_cp313_lock(self):
         self.assertIn("image: debian:13", self.wf)
