@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import unittest
 
+from tests import _requirements
 from tools.msgfmt import PoError, compile_po, parse
 
 MESSAGES = os.path.join(
@@ -53,7 +54,8 @@ def po_files():
 
 
 class TestAgainstGnuMsgfmt(unittest.TestCase):
-    @unittest.skipIf(MSGFMT is None, "GNU msgfmt is not installed")
+    @_requirements.unless_available("msgfmt", MSGFMT is not None,
+                                    "GNU msgfmt is not installed")
     def test_every_catalog_matches_gnu_msgfmt(self):
         paths = sorted(po_files())
         self.assertTrue(paths, "no .po files found to compare")
@@ -75,7 +77,8 @@ class TestAgainstGnuMsgfmt(unittest.TestCase):
 
                     self.assertEqual(expected, actual)
 
-    @unittest.skipIf(MSGFMT is None, "GNU msgfmt is not installed")
+    @_requirements.unless_available("msgfmt", MSGFMT is not None,
+                                    "GNU msgfmt is not installed")
     def test_the_template_itself_matches(self):
         """base.pot is all-untranslated, so both should emit only a header."""
         pot = os.path.join(MESSAGES, "base.pot")

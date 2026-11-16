@@ -32,6 +32,7 @@ import unittest
 sys.argv = [sys.argv[0]]      # importing the shim reaches args.get_args()
 
 from jellyfin_mpv_shim.mpvtk_browser.gateway.hud import HudMixin  # noqa: E402
+from tests import _requirements  # noqa: E402
 
 
 def _mpv_properties():
@@ -56,7 +57,7 @@ class MpvStatPropertiesTest(unittest.TestCase):
     def test_the_names_are_real_mpv_properties(self):
         known = _mpv_properties()
         if known is None:
-            self.skipTest("mpv is not on PATH")
+            _requirements.skip_or_fail(self, "mpv", "mpv is not on PATH")
         missing = [prop for prop, _key in HudMixin._MPV_STATS
                    if prop not in known]
         self.assertEqual(missing, [],

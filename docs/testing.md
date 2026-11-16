@@ -350,6 +350,46 @@ Each worker prints its four-field `JMS-RESULT` line as before, which
 writes the same totals, the skips and one record per module as JSON, for CI.
 Skips do not change the exit status.
 
+### Requiring the optional tools: `JMS_REQUIRE`
+
+Some checks need a tool a bare machine may lack, and skip without it, so the
+suite still runs anywhere. `JMS_REQUIRE` turns that skip into a failure for
+the tools it names:
+
+```
+JMS_REQUIRE=luajit,lua5.2,msgfmt,mypy,mpv  xvfb-run -a python3 tools/run_tests_parallel.py
+```
+
+| Name | Without it, unless required |
+|---|---|
+| `luajit`, `lua5.2` | the renderer Lua tests skip |
+| `msgfmt` | the two GNU msgfmt comparisons skip |
+| `mypy` | the mypy gate is skipped |
+| `mpv` | the mpv option and property checks skip |
+
+- **Unset or empty requires nothing**, and every skip stays a skip.
+- **An unknown or misspelled name stops the run** before any test starts
+  (exit status 2), with the nearest known name. A typo must never quietly
+  require nothing.
+- **Each required Lua interpreter runs the whole renderer suite**, as its own
+  class (`TestRendererLua_luajit`, `TestRendererLua_lua5_2`), and first checks
+  that it really is the dialect its name says: a `lua5.2` that reports
+  Lua 5.1 fails. Debian 13's libmpv embeds Lua 5.2; upstream mpv builds usually
+  embed LuaJIT. `JMS_LUA=lua5.2` picks interpreters directly and overrides
+  `JMS_REQUIRE` for that module. Without either, the first interpreter found
+  runs, as before.
+- **The ceiling notice stays a skip.** `test_there_is_a_local_budget_left`
+  skips when renderer.lua is exactly at the 200-local ceiling. That is a
+  warning about the file, not a missing tool, so requiring Lua does not turn it
+  into a failure. `test_the_ceiling_check_detects_an_over_limit_chunk` proves,
+  under each interpreter, that a chunk one local over the limit fails.
+
+The names are defined in `tests/_requirements.py`, and
+`tests/test_requirements.py` covers both directions without installing
+anything: real modules run with an empty PATH, plus a fake `luajit` that is
+not LuaJIT. Counting and reporting skips stays the runner's job; this only
+decides whether a missing tool may skip.
+
 ### The parallel runner cannot see cross-module interference, and that is the trade
 
 One process per module means a module that poisons the interpreter poisons only

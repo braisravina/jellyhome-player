@@ -6,9 +6,18 @@ textbox `commit` event, `follow` scroll containers) were written and shipped
 against nothing but hand testing. tests/lua/ loads the real renderer against
 a faked mpv and drives it through the real script-message boundary.
 
-Skipped when no Lua interpreter is installed. That makes it invisible on a
-bare machine, which is the tradeoff for not adding a dependency — CI and any
-developer with mpv (which embeds Lua) will have one.
+Skipped when no Lua interpreter is installed, which keeps a bare machine
+able to run the suite. That skip used to be the only behaviour, and it is
+how all 22 tests went unrun everywhere without ever failing -- including on
+the machines that ship the renderer. Now:
+
+* nothing requested: the first interpreter found runs everything, or the
+  whole class skips (and the runner reports the skip, not a pass);
+* ``JMS_REQUIRE=luajit,lua5.2`` (tests/_requirements.py) or
+  ``JMS_LUA=lua5.2``: one class per named interpreter, each running every
+  test, and each FAILING if its interpreter is missing or is not the
+  dialect it claims to be. Debian 13's libmpv embeds Lua 5.2; upstream
+  builds usually embed LuaJIT. CI requires both.
 """
 
 # Run as a script, this is what puts the repo root on sys.path -- without
@@ -27,7 +36,9 @@ import re
 import subprocess
 import unittest
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from tests import _requirements
+
+ROOT =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUA_DIR = os.path.join(ROOT, "tests", "lua")
 RENDERER = os.path.join(ROOT, "jellyfin_mpv_shim", "mpvtk", "renderer.lua")
 THUMBFAST = os.path.join(ROOT, "jellyfin_mpv_shim", "thumbfast.lua")
@@ -35,6 +46,10 @@ THUMBFAST = os.path.join(ROOT, "jellyfin_mpv_shim", "thumbfast.lua")
 # luajit first: it is what mpv itself usually embeds, so it is the dialect
 # the renderer actually has to run under.
 INTERPRETERS = ("luajit", "lua5.1", "lua5.2", "lua5.3", "lua5.4", "lua")
+
+
+#: Pick the interpreters explicitly, comma-separated: JMS_LUA=lua5.2.
+LUA_ENV = "JMS_LUA"
 
 
 def find_lua():
@@ -45,15 +60,41 @@ def find_lua():
     return None
 
 
+def selected_interpreters(environ=None):
+    """The interpreters this run must use, or None for "the first found".
+
+    ``JMS_LUA`` wins when set. Otherwise every Lua interpreter that
+    ``JMS_REQUIRE`` names (see tests/_requirements.py) -- so a CI job that
+    requires luajit and lua5.2 runs the whole renderer suite under each.
+    Anything selected either way FAILS when it is missing; only the
+    unselected default may skip."""
+    env = os.environ if environ is None else environ
+    explicit = [n for n in re.split(r"[\s,]+", env.get(LUA_ENV, "")) if n]
+    if explicit:
+        bad = [n for n in explicit if n not in INTERPRETERS]
+        if bad:
+            raise ValueError("%s names unknown interpreter(s) %s; known: %s"
+                             % (LUA_ENV, ", ".join(repr(b) for b in bad),
+                                ", ".join(INTERPRETERS)))
+        return list(dict.fromkeys(explicit))
+    req = _requirements.required(env)
+    named = [n for n in INTERPRETERS if n in req]
+    return named or None
+
+
 LUA = find_lua()
 
 
-@unittest.skipIf(LUA is None,
-                 "no Lua interpreter (tried: %s)" % ", ".join(INTERPRETERS))
-class TestRendererLua(unittest.TestCase):
+class _RendererLuaTests:
+    """Every renderer test, run under ``self.lua``. Not a TestCase itself:
+    one is built per interpreter at the bottom of this module."""
+
+    lua = None          # path of the interpreter this class runs under
+    lua_name = None     # the name it was found or selected by
+
     def _run(self, script, env=None, target=None):
         return subprocess.run(
-            [LUA, os.path.join(LUA_DIR, script), target or RENDERER],
+            [self.lua, os.path.join(LUA_DIR, script), target or RENDERER],
             cwd=LUA_DIR, capture_output=True, text=True, timeout=120,
             env=env)
 
@@ -289,7 +330,7 @@ class TestRendererLua(unittest.TestCase):
 
     def test_thumbfast_parses_under_this_interpreter(self):
         proc = subprocess.run(
-            [LUA, "-e", "assert(loadfile(%r))" % THUMBFAST],
+            [self.lua, "-e", "assert(loadfile(%r))" % THUMBFAST],
             capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
@@ -297,7 +338,7 @@ class TestRendererLua(unittest.TestCase):
         """Cheap syntax gate, separate from the behavioural run: a parse
         error otherwise surfaces as a wall of failed assertions."""
         proc = subprocess.run(
-            [LUA, "-e", "assert(loadfile(%r))" % RENDERER],
+            [self.lua, "-e", "assert(loadfile(%r))" % RENDERER],
             capture_output=True, text=True, timeout=60)
         self.assertEqual(
             proc.returncode, 0,
@@ -324,24 +365,68 @@ class TestRendererLua(unittest.TestCase):
     #: caring — anything that far from the ceiling is not a hazard.
     HEADROOM_PROBE = 24
 
-    def _headroom(self):
-        """How many more file-scope locals renderer.lua could take."""
-        with open(RENDERER, encoding="utf-8") as fh:
-            source = fh.read()
+    def _compile(self, source):
+        """``(compiles, error)`` for ``source`` under this interpreter."""
+        check = subprocess.run(
+            [self.lua, "-e",
+             "local f, e = load(io.read('*a')); if not f then "
+             "io.stderr:write(e or 'err'); os.exit(1) end"],
+            input=source, capture_output=True, text=True, timeout=60)
+        return check.returncode == 0, check.stderr
+
+    def _headroom(self, source=None):
+        """How many more file-scope locals ``source`` (renderer.lua by
+        default) could take; -1 when it does not compile as it is."""
+        if source is None:
+            with open(RENDERER, encoding="utf-8") as fh:
+                source = fh.read()
         # After the first line, so the shebang-less header comment stays put
         # and the padding is unambiguously file scope.
         head, _nl, rest = source.partition("\n")
         for n in range(self.HEADROOM_PROBE + 1):
             pad = "\n".join("local __pad%d = %d" % (i, i) for i in range(n))
             probe = "%s\n%s\n%s" % (head, pad, rest)
-            check = subprocess.run(
-                [LUA, "-e",
-                 "local f, e = load(io.read('*a')); if not f then "
-                 "io.stderr:write(e or 'err'); os.exit(1) end"],
-                input=probe, capture_output=True, text=True, timeout=60)
-            if check.returncode != 0:
+            if not self._compile(probe)[0]:
                 return n - 1
         return self.HEADROOM_PROBE
+
+    def _assert_budget(self, headroom):
+        """The verdict test_there_is_a_local_budget_left gives ``headroom``:
+        fail below zero, skip AT the ceiling (a notice, not a missing tool),
+        pass otherwise."""
+        self.assertGreaterEqual(
+            headroom, 0,
+            "renderer.lua does not compile.\n\n" + self.LOCAL_CEILING_HELP)
+        if headroom == 0:
+            self.skipTest(
+                "renderer.lua is AT the 200-local ceiling: the next "
+                "file-scope local will break it.\n" + self.LOCAL_CEILING_HELP)
+
+    @staticmethod
+    def _chunk(n):
+        """A main chunk with ``n`` file-scope locals and nothing else."""
+        return "-- fixture\n" + "\n".join(
+            "local v%d = %d" % (i, i) for i in range(n)) + "\n"
+
+    def test_the_ceiling_check_detects_an_over_limit_chunk(self):
+        """The ceiling guard is only worth anything if it fires: a chunk
+        one local over Lua's limit must fail to compile here, be measured
+        as over, and fail the budget test -- under THIS interpreter, since
+        each dialect words the error its own way."""
+        ok, err = self._compile(self._chunk(201))
+        self.assertFalse(ok, "201 file-scope locals compiled under %s"
+                         % self.lua_name)
+        self.assertIn("local variables", err)
+        self.assertTrue(self._compile(self._chunk(200))[0])
+        self.assertEqual(self._headroom(self._chunk(201)), -1)
+        self.assertEqual(self._headroom(self._chunk(200)), 0)
+        self.assertEqual(self._headroom(self._chunk(195)), 5)
+        with self.assertRaises(AssertionError) as over:
+            self._assert_budget(self._headroom(self._chunk(201)))
+        self.assertIn("does not compile", str(over.exception))
+        with self.assertRaises(unittest.SkipTest):
+            self._assert_budget(self._headroom(self._chunk(200)))
+        self._assert_budget(self._headroom(self._chunk(195)))   # no raise
 
     def test_no_renderer_helper_is_defined_and_never_called(self):
         """A `function state.X` nobody calls is a feature that is wired up
@@ -393,14 +478,128 @@ class TestRendererLua(unittest.TestCase):
         This reports the remaining room, so running out is a decision rather
         than a surprise.
         """
-        headroom = self._headroom()
-        self.assertGreaterEqual(
-            headroom, 0,
-            "renderer.lua does not compile.\n\n" + self.LOCAL_CEILING_HELP)
-        if headroom == 0:
-            self.skipTest(
-                "renderer.lua is AT the 200-local ceiling: the next "
-                "file-scope local will break it.\n" + self.LOCAL_CEILING_HELP)
+        self._assert_budget(self._headroom())
+
+    def test_the_interpreter_is_the_one_it_claims_to_be(self):
+        """A `lua5.2` on PATH that is really a 5.4 alias, or a `luajit`
+        that is a wrapper around PUC Lua, would run every test above under
+        the wrong dialect and report it as the right one."""
+        proc = subprocess.run(
+            [self.lua, "-e", "io.write(_VERSION, '|', "
+                             "type(jit) == 'table' and jit.version or '')"],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        version, _bar, jit = proc.stdout.partition("|")
+        self.assertTrue(version.startswith("Lua "), proc.stdout)
+        if self.lua_name == "luajit":
+            self.assertTrue(jit.startswith("LuaJIT"),
+                            "%s is not LuaJIT: %r" % (self.lua, proc.stdout))
+        elif self.lua_name in IDENTITY:
+            self.assertEqual(version, IDENTITY[self.lua_name])
+            self.assertEqual(jit, "", "%s is LuaJIT" % self.lua)
+
+
+#: The `_VERSION` each versioned PUC interpreter must report.
+IDENTITY = {"lua5.1": "Lua 5.1", "lua5.2": "Lua 5.2", "lua5.3": "Lua 5.3",
+            "lua5.4": "Lua 5.4"}
+
+
+def _renderer_case(class_name, lua_name, lua_path, missing):
+    """A TestCase running every renderer test under one interpreter.
+
+    ``missing`` decides what happens without that interpreter: "skip" (the
+    old behaviour, for a run that asked for nothing) or "fail" (it was
+    selected or required, so its absence must not read as a pass)."""
+    # A class statement rather than type(): tests/test_no_uncollected_tests.py
+    # reads the source, and recognises the mixin only from a base list
+    # written out like this one.
+    class cls(_RendererLuaTests, unittest.TestCase):
+        lua = lua_path
+        __doc__ = "renderer tests under %s" % (lua_name or "Lua")
+
+    cls.lua_name = lua_name
+    cls.__name__ = cls.__qualname__ = class_name
+    if lua_path:
+        return cls
+    if missing == "skip":
+        return unittest.skip(
+            "no Lua interpreter (tried: %s)" % ", ".join(INTERPRETERS))(cls)
+    return _requirements.fail_all(
+        "%s is required for the renderer tests but is not on PATH (%s)"
+        % (lua_name, _why_required(lua_name)))(cls)
+
+
+def _why_required(name):
+    if os.environ.get(LUA_ENV):
+        return "%s=%s" % (LUA_ENV, os.environ[LUA_ENV])
+    return "%s=%s" % (_requirements.ENV, os.environ.get(_requirements.ENV, ""))
+
+
+SELECTED = selected_interpreters()
+if SELECTED:
+    for _name in SELECTED:
+        _cls = _renderer_case("TestRendererLua_" + _name.replace(".", "_"),
+                              _name, shutil.which(_name), "fail")
+        globals()[_cls.__name__] = _cls
+    del _name, _cls
+else:
+    TestRendererLua = _renderer_case(
+        "TestRendererLua", LUA and os.path.basename(LUA), LUA, "skip")
+
+
+class RendererInterpreterSelectionTest(unittest.TestCase):
+    """The wiring that decides which interpreters run, which needs none."""
+
+    def test_selection_follows_jms_lua_then_jms_require(self):
+        self.assertIsNone(selected_interpreters({}))
+        self.assertIsNone(selected_interpreters({"JMS_REQUIRE": "msgfmt"}))
+        self.assertEqual(
+            selected_interpreters({"JMS_REQUIRE": "mypy lua5.2,luajit"}),
+            ["luajit", "lua5.2"])
+        self.assertEqual(
+            selected_interpreters({"JMS_LUA": "lua5.2",
+                                   "JMS_REQUIRE": "luajit"}),
+            ["lua5.2"])
+
+    def test_an_unknown_interpreter_is_rejected(self):
+        with self.assertRaises(ValueError) as cm:
+            selected_interpreters({"JMS_LUA": "lua52"})
+        self.assertIn("'lua52'", str(cm.exception))
+        self.assertIn("lua5.2", str(cm.exception))
+
+    def test_a_missing_selected_interpreter_fails_every_test(self):
+        cls = _renderer_case("Probe", "lua5.2", None, "fail")
+        result = unittest.TestResult()
+        unittest.TestLoader().loadTestsFromTestCase(cls).run(result)
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(len(result.failures), result.testsRun)
+        self.assertGreaterEqual(result.testsRun, len(_test_names()))
+        self.assertIn("lua5.2 is required", result.failures[0][1])
+
+    def test_a_missing_unrequested_interpreter_still_skips(self):
+        cls = _renderer_case("Probe", None, None, "skip")
+        result = unittest.TestResult()
+        unittest.TestLoader().loadTestsFromTestCase(cls).run(result)
+        self.assertEqual(result.failures, [])
+        self.assertEqual(len(result.skipped), len(_test_names()))
+
+    def test_every_selected_interpreter_gets_every_renderer_test(self):
+        """What CI relies on: each interpreter it names runs the WHOLE
+        renderer suite, not a class that happens to be empty."""
+        names = _test_names()
+        self.assertGreater(len(names), 20)
+        cases = [v for v in globals().values() if isinstance(v, type)
+                 and issubclass(v, _RendererLuaTests)
+                 and v is not _RendererLuaTests]
+        self.assertEqual(len(cases), len(SELECTED or [None]))
+        for case in cases:
+            self.assertEqual(
+                set(unittest.TestLoader().getTestCaseNames(case)), names,
+                case.__name__)
+
+
+def _test_names():
+    return {n for n in dir(_RendererLuaTests) if n.startswith("test")}
 
 
 if __name__ == "__main__":

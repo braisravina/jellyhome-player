@@ -39,6 +39,7 @@ import unittest
 sys.argv = [sys.argv[0]]      # importing the shim reaches args.get_args()
 
 from jellyfin_mpv_shim.conf import settings  # noqa: E402
+from tests import _requirements  # noqa: E402
 from jellyfin_mpv_shim.mpv_options import (  # noqa: E402
     DEBAND_PRESETS, INTERPOLATION_PRESETS, PRESET_SETTINGS,
     RENDER_QUALITY_PRESETS, deinterlace_value, interpolation_props,
@@ -377,7 +378,7 @@ class MpvVocabularyTest(unittest.TestCase):
     def setUp(self):
         self.choices = _mpv_option_choices()
         if not self.choices:
-            self.skipTest("mpv is not on PATH")
+            _requirements.skip_or_fail(self, "mpv", "mpv is not on PATH")
 
     def test_every_interpolation_preset_uses_options_mpv_has(self):
         for name, props in INTERPOLATION_PRESETS.items():
@@ -419,7 +420,7 @@ class MpvVocabularyTest(unittest.TestCase):
         as on, which is this file's whole subject."""
         names = _mpv_option_names()
         if not names:
-            self.skipTest("mpv is not on PATH")
+            _requirements.skip_or_fail(self, "mpv", "mpv is not on PATH")
         for key, (presets, _fallback) in PRESET_SETTINGS.items():
             for name, props in presets.items():
                 for option in props:
@@ -433,7 +434,7 @@ class MpvVocabularyTest(unittest.TestCase):
         in a diff."""
         names = _mpv_option_names()
         if not names:
-            self.skipTest("mpv is not on PATH")
+            _requirements.skip_or_fail(self, "mpv", "mpv is not on PATH")
         for option in ("deband", "deband-grain", "deband-range",
                        "deband-threshold", "deband-iterations"):
             self.assertIn(option, names)
@@ -475,7 +476,7 @@ class MpvVocabularyTest(unittest.TestCase):
         passing."""
         exe = shutil.which("mpv")
         if not exe:
-            self.skipTest("mpv is not on PATH")
+            _requirements.skip_or_fail(self, "mpv", "mpv is not on PATH")
         out = subprocess.run([exe, "--list-options"], check=True,
                              capture_output=True, text=True, timeout=30).stdout
         for option, expected in DebandLadderTest.MPV_DEFAULTS.items():

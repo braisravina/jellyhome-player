@@ -64,6 +64,22 @@ def _start_mypy_gate():
         encoding="utf-8", errors="replace")
 
 
+def _declared_requirements():
+    """``JMS_REQUIRE`` as validated by tests/_requirements.py.
+
+    Loaded by path rather than imported, for the same reason the tests
+    load this file by path: putting the repo root ahead of `tools/` here
+    is the shadowing hazard the module docstring is about. Raises
+    ValueError (RequirementError) for an unknown name."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_jms_requirements", os.path.join(TESTS, "_requirements.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.required()
+
+
 #: What a worker prints once its tests are done. The parent reads THIS, not
 #: the exit status -- see _worker.
 RESULT = "JMS-RESULT"
@@ -451,6 +467,16 @@ def main():
 
     _utf8(sys.stdout)
     _utf8(sys.stderr)
+    # Before launching anything: a misspelled requirement must stop the
+    # run, not quietly require nothing.
+    try:
+        required = _declared_requirements()
+    except ValueError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 2
+    if required:
+        print("required (JMS_REQUIRE): " + ", ".join(sorted(required)),
+              flush=True)
     modules = _modules()
     jobs = args.jobs or _default_jobs()
     # os.name: Windows has a desktop and no DISPLAY, so the bare check told
@@ -580,7 +606,12 @@ def main():
     for line in _format_summary(summary):
         print(line)
     gate_failed = False
-    if gate is None:
+    if gate is None and "mypy" in required:
+        gate_status = "missing"
+        gate_failed = True
+        print("mypy gate: FAILED -- required (JMS_REQUIRE) but cannot run: "
+              "needs mypy on PATH, and not Windows")
+    elif gate is None:
         gate_status = "skipped"
         print("mypy gate: SKIPPED (needs mypy, and not Windows)")
     else:
