@@ -58,6 +58,60 @@ def _fake_mpv(tmp):
     return exe
 
 
+def _is_ours(pid, exe):
+    """Whether ``pid`` is still the process running ``exe``, our fake.
+
+    Checked before every signal: a pid the fake no longer holds may already
+    belong to something else, and that must never be killed."""
+    try:
+        return os.readlink("/proc/%d/exe" % pid) == os.path.realpath(exe)
+    except OSError:
+        return False
+
+
+def _foreign_fake_mpv(test, seconds=30):
+    """Start a fake mpv that is NOT a child of this process; its pid.
+
+    Identified by the pid it reports itself, never by name: `pgrep -n mpv`
+    took the newest process called mpv on the machine, which with parallel
+    workers (CI runs two) can be another worker's real player. A shell
+    writes its own pid and then execs the fake, so the pid is the fake's;
+    setsid and the exiting outer shell leave it re-parented, as a player
+    from another process would be. Cleanup is registered before the start,
+    so a failed start or a failed assertion still kills it -- and only it.
+    """
+    tmp = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, tmp, True)
+    exe = _fake_mpv(tmp)
+    pidfile = os.path.join(tmp, "pid")
+
+    def kill():
+        try:
+            with open(pidfile, encoding="ascii") as fh:
+                pid = int(fh.read())
+        except (OSError, ValueError):
+            return
+        if _is_ours(pid, exe):
+            os.kill(pid, 9)
+    test.addCleanup(kill)
+
+    subprocess.run(
+        ["sh", "-c", "setsid sh -c 'echo $$ > \"$1\"; exec \"$2\" %d' "
+                     "sh \"$0\" \"$1\" >/dev/null 2>&1 &" % seconds,
+         pidfile, exe], check=True, timeout=10)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            with open(pidfile, encoding="ascii") as fh:
+                pid = int(fh.read())
+        except (OSError, ValueError):
+            pid = None
+        if pid is not None and _is_ours(pid, exe):   # exec has happened
+            return pid, exe
+        time.sleep(0.01)
+    test.fail("the fake mpv did not start within 5 s")
+
+
 @unittest.skipUnless(os.path.isdir("/proc"), "needs /proc")
 class WorkerTeardownTest(unittest.TestCase):
     def test_an_mpv_child_of_the_worker_does_not_outlive_teardown(self):
@@ -76,17 +130,27 @@ class WorkerTeardownTest(unittest.TestCase):
 
     def test_a_process_that_is_not_ours_is_left_alone(self):
         runner = _load_runner()
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp, True)
         # Not a child of this process: started via a shell that exits.
-        subprocess.run(["sh", "-c", "setsid '%s' 30 >/dev/null 2>&1 &"
-                        % _fake_mpv(tmp)], check=True)
-        time.sleep(0.3)
-        pid = int(subprocess.check_output(
-            ["pgrep", "-nx", "mpv"]).split()[0])
-        self.addCleanup(lambda: os.kill(pid, 9))
+        pid, exe = _foreign_fake_mpv(self)
+        with open("/proc/%d/stat" % pid, encoding="ascii") as fh:
+            ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        self.assertNotEqual(ppid, os.getpid())     # really not our child
         runner._teardown_players(grace=1)
         os.kill(pid, 0)   # still alive: raises if it was killed
+        # ...and still the same process, not a reused pid.
+        self.assertTrue(_is_ours(pid, exe))
+
+    def test_the_fake_is_found_by_pid_even_beside_a_newer_mpv(self):
+        """Another worker's mpv started just after ours must not be taken
+        for ours: that is what the old `pgrep -n mpv` lookup did."""
+        mine, my_exe = _foreign_fake_mpv(self)
+        newer, newer_exe = _foreign_fake_mpv(self)
+        self.assertNotEqual(mine, newer)
+        self.assertTrue(_is_ours(mine, my_exe))
+        self.assertFalse(_is_ours(mine, newer_exe))
+        self.assertTrue(_is_ours(newer, newer_exe))
+        with open("/proc/%d/comm" % newer, encoding="ascii") as fh:
+            self.assertEqual(fh.read().strip(), "mpv")   # same name, other pid
 
 
 @unittest.skipUnless(os.path.isdir("/proc"), "needs /proc")
