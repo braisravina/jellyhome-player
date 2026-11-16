@@ -19,6 +19,15 @@
 # §1.4 for the measurement behind that split.
 set -u
 
+# One collation for every sort and comm below, whatever the caller's locale.
+# comm needs both inputs ordered the same way, and the baseline was sorted on
+# a machine whose locale (en_GB.UTF-8: punctuation ignored) orders lines with
+# a leading quote differently from CI's C.UTF-8. Under the wrong one, comm
+# printed baseline findings as NEW and failed the gate (CI run 43846807449).
+# The baseline is also re-sorted on every read, so the order it happens to be
+# stored in can never matter again.
+export LC_ALL=C
+
 cd "$(dirname "$0")/.." || exit 1
 BASELINE="tools/mypy-baseline.txt"
 
@@ -58,7 +67,7 @@ if [ ! -f "$BASELINE" ]; then
     exit 1
 fi
 
-new="$(comm -13 "$BASELINE" <(printf '%s\n' "$current"))"
+new="$(comm -13 <(sort -u "$BASELINE") <(printf '%s\n' "$current"))"
 if [ -n "$new" ]; then
     echo "NEW mypy findings (not in $BASELINE):"
     printf '%s\n' "$new" | sed 's/^/  /'
@@ -67,7 +76,7 @@ if [ -n "$new" ]; then
     exit 1
 fi
 
-fixed="$(comm -23 "$BASELINE" <(printf '%s\n' "$current"))"
+fixed="$(comm -23 <(sort -u "$BASELINE") <(printf '%s\n' "$current"))"
 if [ -n "$fixed" ]; then
     echo "$(printf '%s\n' "$fixed" | grep -c .) baseline finding(s) no longer occur."
     echo "Re-baseline to lock the improvement in: tools/mypy_gate.sh --update"
