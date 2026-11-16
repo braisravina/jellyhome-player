@@ -37,7 +37,7 @@ from urllib.parse import urlparse
 # server -- so a late result can only refresh this cache, never a connection.
 _hostname_lock = threading.Lock()
 _hostname_thread = None
-_hostname_ips = []
+_hostname_ips: "list[ipaddress.IPv4Address | ipaddress.IPv6Address]" = []
 
 
 def _hostname_lookup():

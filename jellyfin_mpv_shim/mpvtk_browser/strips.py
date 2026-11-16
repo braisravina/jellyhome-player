@@ -810,7 +810,7 @@ class StripStore:
         it always has: rows in different containers or columns, a
         fractional y, overlapping rows, a scaled or file-backed image.
         """
-        groups = {}
+        groups: dict[object, list[dict]] = {}
         for node in nodes:
             g = node.pop("wg", None)
             if g is not None:

@@ -104,7 +104,7 @@ ignore_missing_imports = true
 
 # Optional, platform-specific, and shipped without stubs.
 [[tool.mypy.overrides]]
-module = ["gi", "gi.*", "pillow_jxl"]
+module = ["gi", "gi.*", "pillow_jxl", "win32gui"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
