@@ -1,0 +1,159 @@
+name: tests
+
+# The one job that runs the FULL unit suite. The packaging jobs in main.yml
+# build and install-test the deliverables; they do not run the suite, and
+# nothing else should either, so it runs once per push, here.
+on:
+  push:
+    branches:
+      - master
+      - main
+      - working
+      - jellyhome-privacy-fork
+  pull_request:
+    branches:
+      - master
+      - main
+      - working
+      - jellyhome-privacy-fork
+  workflow_dispatch:
+# Reads the repository and uploads a report; needs nothing else.
+permissions:
+  contents: read
+
+jobs:
+  linux-full-tests:
+    # Debian 13, in a container, because that is the platform the suite is
+    # measured on and the .deb targets: Python 3.13 (the cp313 lock),
+    # mpv/libmpv 0.40 with Lua 5.2 embedded. The Ubuntu runner only hosts it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:13
+      # The memory ceiling, enforced by the container's cgroup for EVERY
+      # process in the job (workers, mpv, Xvfb, the mypy gate), swap included
+      # -- the same 3 GiB that tools/limited_run.sh gives a local run. Checked,
+      # not assumed, in "Check the memory ceiling" below.
+      options: --memory=3g --memory-swap=3g
+    env:
+      LANG: C.UTF-8
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_CACHE_DIR: "1"
+      # Every optional tool the suite knows, required: missing means FAIL,
+      # never skip (tests/_requirements.py). luajit and lua5.2 also make the
+      # renderer tests run once under EACH dialect (tests/test_renderer_lua.py).
+      JMS_REQUIRE: luajit,lua5.2,msgfmt,mypy,mpv
+      REPORT: /tmp/jms-ci/test-report.json
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Install system packages
+      timeout-minutes: 10
+      # git before checkout, or actions/checkout falls back to a tarball and
+      # the doc tests' `git ls-files` has nothing to list. The font packages
+      # are exactly those on the Debian 13 machine the suite is measured on,
+      # so the font-availability skips (tools/ci_allowed_skips.txt) are the
+      # same ones; add a font here and some of them start to run.
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          ca-certificates git python3 python3-venv \
+          xvfb xauth libgl1-mesa-dri mpv libmpv2 luajit lua5.2 gettext fontconfig \
+          fonts-cantarell fonts-dejavu-core fonts-dejavu-extra fonts-dejavu-mono \
+          fonts-droid-fallback fonts-font-awesome fonts-freefont-ttf fonts-liberation \
+          fonts-liberation-sans-narrow fonts-noto-color-emoji fonts-noto-mono \
+          fonts-opensymbol fonts-quicksand fonts-symbola fonts-urw-base35 xfonts-scalable
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+    - name: Check the memory ceiling
+      # "Where supported": a host without cgroup v2 memory control gets a
+      # warning on the run page rather than a silent unlimited run. A limit
+      # that is present but not 3 GiB is a configuration error.
+      run: |
+        max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unsupported)
+        swap=$(cat /sys/fs/cgroup/memory.swap.max 2>/dev/null || echo unsupported)
+        echo "memory.max=$max memory.swap.max=$swap"
+        case "$max" in
+          3221225472) echo "memory ceiling: 3 GiB for the whole job" ;;
+          unsupported|max) echo "::warning title=No memory ceiling::this host does not enforce the container's 3 GiB limit (memory.max=$max)" ;;
+          *) echo "::error title=Wrong memory ceiling::memory.max=$max, expected 3221225472"; exit 1 ;;
+        esac
+    - name: Install Python dependencies
+      timeout-minutes: 10
+      # Two venvs from hash-pinned locks, --no-deps so nothing unpinned can
+      # slip in. The suite runs against exactly what the .deb bundles; the
+      # mypy gate gets those plus the `all` extra, as its baseline was
+      # recorded with (see the header of tools/ci-mypy-cp313-amd64.lock).
+      # Only `mypy` itself goes on PATH.
+      run: |
+        python3 -m venv /opt/venv-test
+        /opt/venv-test/bin/pip install --require-hashes --no-deps \
+          -r linux/requirements-linux-cp313-amd64.lock
+        python3 -m venv /opt/venv-mypy
+        /opt/venv-mypy/bin/pip install --require-hashes --no-deps \
+          -r linux/requirements-linux-cp313-amd64.lock -r tools/ci-mypy-cp313-amd64.lock
+        ln -s /opt/venv-mypy/bin/mypy /usr/local/bin/mypy
+    - name: Prepare an unprivileged test user
+      # Not root: several tests check what happens when a file cannot be
+      # read or written, and root can read and write anything.
+      run: |
+        useradd --create-home tester
+        chown -R tester: "$GITHUB_WORKSPACE"
+        install -d -o tester /tmp/jms-ci
+    - name: Toolchain
+      run: |
+        {
+          echo "## Toolchain"
+          echo '```'
+          /opt/venv-test/bin/python --version
+          mpv --version | head -n 1
+          luajit -v
+          lua5.2 -v
+          msgfmt --version | head -n 1
+          mypy --version
+          echo "fonts: $(fc-list | wc -l) faces"
+          /opt/venv-test/bin/pip list --format=freeze
+          echo '```'
+        } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+    - name: Run the full suite
+      timeout-minutes: 30
+      # -j 2 on a 4-vCPU runner: the workers share one Xvfb, and the memory
+      # ceiling above covers them all. --timeout bounds each module.
+      run: |
+        runuser -u tester -- env HOME=/home/tester \
+          PATH="/opt/venv-test/bin:$PATH" JMS_REQUIRE="$JMS_REQUIRE" \
+          xvfb-run -a python tools/run_tests_parallel.py -q -j 2 --timeout 300 \
+            --report "$REPORT"
+    - name: Check the report
+      # Always, so a failed or crashed run still gets its totals, skips and
+      # reasons on the run page. Fails on any skip not in the allowlist, on a
+      # requirement the run did not declare, on a module that should have run
+      # and did not, and on a missing report.
+      if: always()
+      run: |
+        python3 tools/ci_check_report.py "$REPORT" \
+          --allowed-skips tools/ci_allowed_skips.txt \
+          --require "$JMS_REQUIRE" \
+          --expect-run test_renderer_lua.py \
+          --expect-run test_msgfmt.py \
+          --expect-run test_po_lint.py \
+          --expect-run test_pot_context.py \
+          --expect-run test_mpv_stat_properties.py \
+          --expect-run test_picture_processing.py \
+          --expect-run test_requirements.py
+    - name: Memory used
+      if: always()
+      run: |
+        peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0)
+        oom=$(awk '/^oom_kill /{print $2}' /sys/fs/cgroup/memory.events 2>/dev/null)
+        echo "- peak memory for the whole job: $((peak / 1048576)) MiB of 3072; OOM kills: ${oom:-unknown}" \
+          | tee -a "$GITHUB_STEP_SUMMARY"
+    - name: Upload the report
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: linux-full-tests-report
+        path: /tmp/jms-ci/test-report.json
+        if-no-files-found: warn

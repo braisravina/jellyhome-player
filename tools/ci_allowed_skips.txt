@@ -1,0 +1,44 @@
+# Skips the Linux full-test CI job accepts. Read by tools/ci_check_report.py.
+#
+#   <test module file>  <regex searched in the FIRST line of the skip reason>
+#
+# Any skip not matched here FAILS the job. That is the point: a new skip is
+# coverage that quietly went away, and the run would otherwise read OK.
+#
+# What may NOT appear here: a skip because a tool is missing. luajit, lua5.2,
+# msgfmt, mypy and mpv are required in CI (JMS_REQUIRE), so their absence is
+# a failure before it can ever be a skip; see tests/_requirements.py.
+#
+# Every entry says why the skip is legitimate on the CI host. Entries the run
+# did not need are listed in the job summary but do not fail it.
+
+# --- The renderer's file-scope local budget --------------------------------
+# A notice, not a missing tool: renderer.lua sits exactly at Lua's 200-local
+# ceiling, so the budget test reports "no headroom left" as a skip once per
+# interpreter. Over the ceiling it FAILS (and the over-limit fixture in
+# test_the_ceiling_check_detects_an_over_limit_chunk proves the check can).
+test_renderer_lua.py  ^renderer\.lua is AT the 200-local ceiling
+
+# --- Font availability -------------------------------------------------------
+# These tests reproduce font-fallback bugs that need a particular PAIR of
+# installed faces (one lacking a script, one covering it). The CI image
+# installs the same font packages as the Debian 13 machine the suite is
+# measured on (see .github/workflows/tests.yml), where all of these skip too.
+# They test the fallback logic against real files when a host has them;
+# their pure-logic counterparts run everywhere.
+test_epub_layout.py  ^no face pair on this host reproduces #736
+test_mpvtk_pilfont.py  ^no face pair on this host reproduces #736
+test_mpvtk_pilfont.py  ^no Han-without-Hangul face pair on this host$
+test_mpvtk_pilfont.py  ^no Latin face measured to lack Hebrew here$
+test_mpvtk_pilfont.py  ^no Noto Sans here to stand in for that host$
+test_mpvtk_pilfont.py  ^the first Arabic candidate is not installed here$
+test_mpvtk_pilfont.py  ^this host's first Arabic face already has Latin, so there is no gap to close
+# unicode-data is not a font, but it is the same kind of skip: a reference
+# file the host may or may not carry, checked against when present.
+test_mpvtk_pilfont.py  ^no local UTS #51 emoji-data\.txt \(unicode-data\)$
+
+# --- The container has no systemd -------------------------------------------
+# ScopeMonitorTest drives tools/limited_run.sh, which needs a systemd USER
+# manager. CI enforces its memory ceiling with the container's own cgroup
+# instead (docker --memory), and never calls limited_run.sh.
+test_test_harness_limits.py  ^needs a systemd user manager$

@@ -626,7 +626,8 @@ def main():
     if failed:
         print("FAILED modules: " + " ".join(sorted(m for m, *_ in failed)))
     if args.report:
-        _write_report(args.report, summary, done, gate_status, jobs, elapsed)
+        _write_report(args.report, summary, done, gate_status, jobs, elapsed,
+                      required)
     if failed or gate_failed:
         return 1
     skipped = summary["totals"]["skipped"]
@@ -634,8 +635,13 @@ def main():
     return 0
 
 
-def _write_report(path, summary, done, gate_status, jobs, elapsed):
-    """``--report``: the summary plus one record per module, as JSON."""
+def _write_report(path, summary, done, gate_status, jobs, elapsed,
+                  required=()):
+    """``--report``: the summary plus one record per module, as JSON.
+
+    ``required`` is what JMS_REQUIRE declared, so that whoever reads the
+    report (tools/ci_check_report.py) can tell a run that enforced the
+    optional tools from one that merely happened to have them."""
     modules = []
     for mod, rc, secs, _out, count, outcome in sorted(done):
         rec = {"module": mod, "status": "failed" if rc else "ok",
@@ -646,7 +652,8 @@ def _write_report(path, summary, done, gate_status, jobs, elapsed):
             rec["skips"] = outcome.get("skips", [])
         modules.append(rec)
     doc = dict(summary, mypy_gate=gate_status, workers=jobs,
-               seconds=round(elapsed, 1), modules=modules)
+               seconds=round(elapsed, 1), modules=modules,
+               required=sorted(required))
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=1, sort_keys=True)
         fh.write("\n")

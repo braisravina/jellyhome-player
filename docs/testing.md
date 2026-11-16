@@ -390,6 +390,48 @@ anything: real modules run with an empty PATH, plus a fake `luajit` that is
 not LuaJIT. Counting and reporting skips stays the runner's job; this only
 decides whether a missing tool may skip.
 
+### The CI job: `.github/workflows/tests.yml`
+
+The only place the full suite runs in CI. The packaging jobs in `main.yml`
+build and install-test the deliverables; they do not run it.
+
+- **Debian 13 in a container** (`debian:13` on an Ubuntu runner). That is
+  where the suite is measured and the `.deb` is aimed: Python 3.13, the cp313
+  lock, and mpv/libmpv 0.40 with Lua 5.2 embedded. It installs the same font
+  packages as the measuring machine, so the font skips are the same.
+- **Every optional tool is required**: `JMS_REQUIRE=luajit,lua5.2,msgfmt,mypy,mpv`.
+- **Two venvs, both from hash-pinned locks.** The tests run against
+  `linux/requirements-linux-cp313-amd64.lock`, exactly what the `.deb`
+  bundles. The mypy gate's venv adds `tools/ci-mypy-cp313-amd64.lock`: mypy
+  2.4.0 plus the `all` extra, which the mypy baseline expects. Only the `mypy`
+  executable from that venv goes on PATH.
+- **Bounded.** The container is capped at 3 GiB (`--memory=3g
+  --memory-swap=3g`), a cgroup ceiling that covers every process in the job.
+  A step checks the ceiling is really in force: a host that cannot enforce it
+  gets a warning, and a wrong value fails the job. The job has
+  `timeout-minutes`, the suite step has its own, and `--timeout 300` bounds
+  each module.
+- **Not root.** The suite runs as an unprivileged user under `xvfb-run`,
+  because several tests check what happens when a file cannot be read.
+- **The verdict is `tools/ci_check_report.py`.** It reads the runner's
+  `--report` JSON and fails the job when any of these happen:
+  - a failure, error or unexpected success;
+  - a module with no outcome, or a test that never started;
+  - the mypy gate is not `ok`;
+  - a requirement the run did not declare;
+  - an expected module (renderer, msgfmt, po lint, mpv checks) did not run;
+  - a skip that `tools/ci_allowed_skips.txt` does not list.
+
+  The allowlist holds only reasons that are legitimate on that host: font
+  availability, the renderer ceiling notice, and the systemd-scope tests. It
+  may never list a missing tool, and `tests/test_ci_check_report.py` enforces
+  that. Totals, every skip with its reason, and the peak memory go to the
+  job's summary page, and the report is uploaded as an artifact.
+
+**A new skip fails CI on purpose.** If a change adds a legitimate one (a test
+that needs a font the image lacks), add it to the allowlist with the reason it
+is legitimate, in the same commit.
+
 ### The parallel runner cannot see cross-module interference, and that is the trade
 
 One process per module means a module that poisons the interpreter poisons only

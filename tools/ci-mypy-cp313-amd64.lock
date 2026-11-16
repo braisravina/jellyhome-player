@@ -1,0 +1,25 @@
+# The mypy gate's environment in the Linux full-test CI job (.github/workflows/tests.yml),
+# installed ON TOP OF linux/requirements-linux-cp313-amd64.lock into a venv of its own.
+# Python 3.13 / amd64. Hash-pinned and installed with --require-hashes --no-deps, like the
+# Debian lock; the hashes are the PyPI wheel digests (trust on first use: not a signature).
+#
+# Why a separate venv: tools/mypy-baseline.txt was recorded with the `all` extra installed
+# (it expects pystray "installed, but missing library stubs" and no finding for pypresence,
+# which ships py.typed), while the test suite is measured WITHOUT those extras. One venv
+# for both would change one of the two. Only the `mypy` executable from this venv is put
+# on PATH; mypy resolves imports through its own interpreter.
+#
+# mypy 2.4.0 and its dependencies are the releases current on 2026-10-24, the day the
+# baseline was last recorded (commit aaded8f6). Raising the pin can add or drop findings:
+# re-run tools/mypy_gate.sh with the new version and re-baseline in the same commit.
+mypy==2.4.0 --hash=sha256:6be721bd4bd57576193653b75b4af3461c9d0bf7dd8b528f782e9be210dc75bb --hash=sha256:d01c5d26a352acc6d5cf3128225477e1e8465e8d3029d4c345807fbf7f3cf093
+mypy-extensions==1.1.0 --hash=sha256:1be4cccdb0f2482337c4743e60421de3a356cd97508abadd57d47403e94f5505
+typing-extensions==4.16.0 --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+pathspec==1.1.1 --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
+librt==0.16.0 --hash=sha256:17bac7f7a16b328fff77e440287693eb017abde913595b5827ebccbc21ecd8a6
+ast-serialize==0.13.1 --hash=sha256:9f99786e0d62082a5b121b3437f3167562133711df22128de1e9886f57f0b226
+# The `all` extra (pyproject.toml), and pystray's Linux dependencies.
+pystray==0.19.5 --hash=sha256:a0c2229d02cf87207297c22d86ffc57c86c227517b038c0d3c59df79295ac617
+six==1.17.0 --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
+python-xlib==0.33 --hash=sha256:c3534038d42e0df2f1392a1b30a15a4ff5fdc2b86cfa94f072bf11b10a164398
+pypresence==4.6.2 --hash=sha256:6587e525a663699ca5fb8621ea147a9c264c135650c50afbccd7b5d9b4e28dc0
