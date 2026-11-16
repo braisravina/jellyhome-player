@@ -63,11 +63,13 @@ jobs:
       # the doc tests' `git ls-files` has nothing to list. The font packages
       # are exactly those on the Debian 13 machine the suite is measured on,
       # so the font-availability skips (tools/ci_allowed_skips.txt) are the
-      # same ones; add a font here and some of them start to run.
+      # same ones; add a font here and some of them start to run. procps
+      # provides pgrep, which tests/test_test_harness_limits.py runs; it is
+      # "important", not "required", so the minimal image does not have it.
       run: |
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-          ca-certificates git python3 python3-venv \
+          ca-certificates git procps python3 python3-venv \
           xvfb xauth libgl1-mesa-dri mpv libmpv2 luajit lua5.2 gettext fontconfig \
           fonts-cantarell fonts-dejavu-core fonts-dejavu-extra fonts-dejavu-mono \
           fonts-droid-fallback fonts-font-awesome fonts-freefont-ttf fonts-liberation \
@@ -121,6 +123,7 @@ jobs:
           lua5.2 -v
           msgfmt --version | head -n 1
           mypy --version
+          pgrep --version
           echo "fonts: $(fc-list | wc -l) faces"
           /opt/venv-test/bin/pip list --format=freeze
           echo '```'
