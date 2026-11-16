@@ -51,7 +51,7 @@ from . import components, theme
 from .components import chrome
 from .components.detail import fmt_ticks
 from .scroll_state import ScrollState
-from .strips import Tile, logo_plate
+from .strips import SiblingWindow, Tile, logo_plate
 from .thumbnails import make_key
 
 log = logging.getLogger("mpvtk_browser.tile_renderer")
@@ -552,6 +552,17 @@ class TileRenderer:
                                 lambda im, k=key: self._image_done(k, im),
                                 cover=cover)
         return None
+
+    def _art_in_flight(self, key):
+        """Whether ``key``'s artwork has been asked for and may still
+        arrive: requested, and neither gone from the server nor given up on
+        (both of which keep the request marker set -- see _image_done)."""
+        if key not in self._requested:
+            return False
+        if self.art.thumbs is not None and self.art.thumbs.is_gone(key):
+            return False
+        return (self._img_retry.get(key, (0, 0.0))[0]
+                <= self.IMG_MAX_ATTEMPTS)
 
     def _image_done(self, key, image):
         """Thumbnail delivery, on the loop thread.
@@ -1360,7 +1371,7 @@ class TileRenderer:
                           # pair immediately after the heading text instead
                           # of at the far edge.
                           align="center", w=self.row_view_w())
-        return chrome.bleed(Column(
+        block = chrome.bleed(Column(
             [
                 heading,
                 self.hscroll_row(content, row_id,
@@ -1369,7 +1380,20 @@ class TileRenderer:
             ],
             gap=TITLE_GAP,
         ))
-    def window_rows(self, blocks, scroll_id, size, gap, pad=0):
+        # The row's own strip, for window_rows to mark (``windows=True``).
+        # Absent on a lazy stand-in, whose content is a Spacer.
+        strip = content
+        if isinstance(strip, Stack) and strip.children:
+            strip = strip.children[0]          # the hover chip rides on top
+        if isinstance(strip, ImageMap):
+            block._jms_strip = strip
+            # ...and its carousel's scroll id, whose live offset says whether
+            # the row is at rest (see _mark_window).
+            block._jms_row_id = row_id
+        return block
+
+    def window_rows(self, blocks, scroll_id, size, gap, pad=0,
+                    windows=False):
         """``blocks`` with every lazy :meth:`tile_row` that is within a
         screen of the viewport made real -- :meth:`row_window`'s rule, for a
         stack of carousels rather than a grid.
@@ -1381,13 +1405,27 @@ class TileRenderer:
         ``blocks`` is the scroll's direct children; the page must also
         repaint on scroll (``ScrollState.on_scroll``), or rows that scroll
         into the window are never made real.
+
+        ``windows=True`` also gives the carousels near the viewport one
+        combined overlay window (a :class:`SiblingWindow` group): while the
+        page scrolls vertically the renderer then issues one overlay-add a
+        frame for them instead of one per carousel -- the grid's
+        optimisation (grid_of, StripStore.window) for a stack of rows that
+        each scroll sideways on their own. The range is sticky
+        (overlay_window_span), and a row still waiting for a poster is left
+        out (image_map's ``_jms_awaiting_art``): its strip recomposites as
+        each poster lands, and every recomposite of a member is a new
+        window, so a loading screen would otherwise copy one per poster.
+        Nothing else about the rows changes; anything the window cannot
+        prove draws as its own overlay, exactly as before. Which rows, and
+        when none at all: see _mark_window.
         """
         from ..mpvtk.layout import measure
 
         vh = max(240.0, float(size[1]))
         top = self.scroll.offset(scroll_id)
         lo, hi = top - vh, top + 2 * vh
-        out, y = [], float(pad)
+        out, extents, y = [], [], float(pad)
         for b in blocks:
             if b is None:
                 continue
@@ -1396,8 +1434,117 @@ class TileRenderer:
             if realize is not None and y + h >= lo and y <= hi:
                 b = realize()
             out.append(b)
+            extents.append((y, h))
             y += h + gap
+        if windows:
+            self._mark_window(out, extents, scroll_id, top, vh)
         return out
+
+    def _mark_window(self, blocks, extents, scroll_id, top, vh):
+        """Mark the carousels that share ``scroll_id``'s combined window.
+
+        Eligible: a real carousel strip, with no poster still on its way
+        (``_jms_awaiting_art``), and AT REST -- its carousel's live offset
+        (ScrollState, read from the renderer at the top of every build) at
+        its start. A carousel paged sideways keeps its own overlay and its
+        lines in the window stay transparent, so the rows above and below
+        still merge across it as one rectangle. Left in, it split the run
+        into three overlay-adds, and mpv clears its whole atlas on every
+        add (measured: the 1080p 90th percentile went from ~14 to ~16 ms).
+        An offset Python cannot know reads as 0, which leaves the row in:
+        the renderer's per-frame checks then draw it on its own whenever
+        it does not line up, as before.
+
+        Which rows: the sticky span (overlay_window_span) if the window it
+        needs fits the store's cap; else only those within the viewport
+        plus WINDOW_LOOKAHEAD; else NONE. Never a part of what is on
+        screen: a window holding two of four visible rows still costs
+        several overlay-adds a frame, and its tall crop pushed mpv's
+        atlas a size up -- at 4K that was slower than no window at all
+        (measured: 49 -> 58 ms median). The size is estimated from the
+        rows' blocks, headings included, so it errs towards falling back.
+
+        **The fit is judged on every carousel in the range, eligible or
+        not.** Rows left out (paged, or still loading) take their place in
+        the picture either way; judged on the eligible rows alone, a 4K
+        screen whose other rows were loading got exactly the partial window
+        this rule exists to prevent.
+        """
+        y0, y1 = self.overlay_window_span(scroll_id, top, vh, extents)
+        rows = []                       # (strip, y, h, eligible)
+        for b, (by, bh) in zip(blocks, extents):
+            strip = getattr(b, "_jms_strip", None)
+            if strip is None:
+                continue
+            row_id = getattr(b, "_jms_row_id", None)
+            eligible = not (
+                getattr(strip, "_jms_awaiting_art", False)
+                or (row_id is not None
+                    and self.scroll.offset(row_id) > ScrollState.EDGE))
+            rows.append((strip, by, bh, eligible))
+
+        def pick(a, z):
+            return [r for r in rows if r[1] + r[2] > a and r[1] < z]
+
+        cap = self.art.strips.window_cap()
+        width = px(self.row_view_w())
+
+        def fits(sel):
+            if len(sel) < 2:
+                return True             # nothing to merge, nothing to copy
+            h = sel[-1][1] + sel[-1][2] - sel[0][1]
+            return width * px(h) * 4 <= cap
+
+        chosen = pick(y0, y1)
+        if not fits(chosen):
+            chosen = pick(max(0.0, top - self.WINDOW_LOOKAHEAD),
+                          top + vh + self.WINDOW_LOOKAHEAD)
+            if not fits(chosen):
+                return
+        group = SiblingWindow("%s#win" % scroll_id)
+        for strip, _y, _h, eligible in chosen:
+            if eligible:
+                strip.win = group
+
+    def overlay_window_span(self, scroll_id, top, vh, extents=()):
+        """``(y0, y1)``, the content-y range whose carousels share a stacked
+        page's combined window (window_rows ``windows=True``). Logical.
+
+        overlay_window_rows' rule for blocks of unequal height: sticky while
+        it still covers the viewport plus WINDOW_LOOKAHEAD each way, then
+        re-centred with WINDOW_SLACK either side -- so a window, a copy of
+        the rows in it, is rebuilt when the view has really moved rather
+        than on every push. ``extents`` (each block's ``(y, h)``) make it
+        WHOLE ROWS, as overlay_window_rows' indexes are: a re-centred span
+        grows to the edges of the blocks it touches, so the next pushes
+        select exactly those blocks again. A continuous span re-centred a
+        little at a time changed the selected rows on half the pushes."""
+        need = (max(0.0, top - self.WINDOW_LOOKAHEAD),
+                top + vh + self.WINDOW_LOOKAHEAD)
+        held = getattr(self, "_overlay_windows", None)
+        if held is None:
+            held = {}
+            self._overlay_windows = held
+        key = ("span", scroll_id, vh)
+        prev = held.get(key)
+        if prev is not None and prev[0] <= need[0] and need[1] <= prev[1]:
+            return prev
+        # Twice the lookahead at least: a span re-centred with only the
+        # lookahead either side covers nothing beyond this push and moves on
+        # every one (overlay_window_rows gets away with it by counting
+        # whole rows; a span is continuous).
+        slack = max(self.WINDOW_SLACK * vh, 2 * self.WINDOW_LOOKAHEAD)
+        win = (max(0.0, top - slack), top + vh + slack)
+        touched = [(y, y + h) for y, h in extents
+                   if y + h > win[0] and y < win[1]]
+        if touched:
+            win = (min(win[0], min(a for a, _b in touched)),
+                   max(win[1], max(b for _a, b in touched)))
+        held.pop(key, None)
+        held[key] = win
+        while len(held) > 16:       # one per scroll container seen
+            held.pop(next(iter(held)))
+        return win
 
     def header_offset(self, header):
         """Exact content-y of the first tile row that follows ``header`` in a
@@ -1597,6 +1744,12 @@ class TileRenderer:
         node = ImageMap(s["src"], s["iw"], s["ih"], regions=regions,
                         id="%s#strip" % prefix,
                         v=s.get("v", 0), w=s["lw"], h=s["lh"])
+        # Whether a poster in this row is still on its way: the strip will
+        # recomposite when it lands. window_rows keeps such a row out of a
+        # combined window (see there).
+        node._jms_awaiting_art = any(
+            t.poster is None and t.poster_tag
+            and self._art_in_flight(t.poster_tag) for t in tiles)
         if chip is None:
             return node
         # Inside the strip's own rect, so it travels with the row when a

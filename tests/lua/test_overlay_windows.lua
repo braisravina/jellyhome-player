@@ -443,7 +443,10 @@ end
 -- a SiblingWindow (strips.py) and copies only each strip's leading viewport
 -- width -- so the window is narrower than the strips. Every carousel still
 -- scrolls sideways on its own; whatever the offsets, the picture must be the
--- one the rows draw without a window.
+-- one the rows draw without a window. `opts.exclude = k` is a carousel
+-- TileRenderer left out because it was paged sideways: it has no `win`, its
+-- lines in the window are transparent, and the other rows' window indexes
+-- close up around it.
 local LEAD = 6
 local function stack(rows, opts)
     bitmaps = {}
@@ -471,7 +474,8 @@ local function stack(rows, opts)
     end
     add_bitmap(WINBASE, ww, wh, function(x, y)
         for k, r in ipairs(rows) do
-            if y >= r.wy and y < r.wy + r.ih and x < copies[k] then
+            if k ~= opts.exclude and y >= r.wy and y < r.wy + r.ih
+                    and x < copies[k] then
                 return k * 1000000 + (y - r.wy) * 1000 + x + 1
             end
         end
@@ -492,9 +496,11 @@ local function stack(rows, opts)
         local node = { id = "row" .. k, t = "img", sc = cid,
             src = "&" .. base, iw = r.iw, ih = r.ih, v = 1,
             x = sx + LEAD, y = r.y, w = r.iw, h = r.ih }
-        if opts.win then
+        if opts.win and k ~= opts.exclude then
+            local i = k - 1
+            if opts.exclude and k > opts.exclude then i = i - 1 end
             node.win = { src = "&" .. WINBASE, w = ww, h = wh, y = r.wy,
-                         i = k - 1, v = 3, g = "home#win" }
+                         i = i, v = 3, g = "home#win" }
         end
         nodes[#nodes + 1] = node
         nodes[#nodes + 1] = { id = "row" .. k .. "-t", t = "rect", sc = cid,
@@ -744,6 +750,80 @@ do
        "\n  plain:    " .. a .. "\n  windowed: " .. b)
 end
 
+-- ============================================================ 7. a row left out
+-- TileRenderer leaves a paged carousel out of the window. Left in, it split
+-- the run around it into three overlay-adds; left out, the rows above and
+-- below merge ACROSS its transparent lines into one rectangle, and the row
+-- draws itself on top: two adds, and the same picture.
+do
+    local rows = carousels(6, 400, 14, 22, 4)
+    local function per_frame(opts, hoffs)
+        scene({}); settle()
+        show_stack(rows, opts, 0, hoffs)
+        local per = {}
+        for step = 1, 4 do
+            local mark = #fake.log.commands
+            scroll_to("home", step * 3)
+            per[#per + 1] = (adds_since(mark))
+        end
+        return table.concat(per, ",")
+    end
+    local inside = per_frame({ win = true }, { [3] = 40 })
+    local left_out = per_frame({ win = true, exclude = 3 }, { [3] = 40 })
+    ok(left_out == "2,2,2,2" and inside == "3,3,3,3",
+       "a paged carousel left out costs 2 adds a frame, not 3 (left out "
+       .. left_out .. ", inside " .. inside .. ")")
+    local cases = {
+        -- { row left out, its offset, vertical offset, extra opts }
+        { "first", 1, 40, 9 }, { "middle", 3, 40, 9 }, { "last", 6, 40, 9 },
+        -- the frames before the rebuild that puts it back: at rest, still out
+        { "back at its start", 3, 0, 9 },
+        { "a few columns in", 3, 2, 3 },
+        { "with its hover chip", 3, 40, 9, { chip = 3 } },
+        { "under a dialog", 4, 60, 9,
+          { extra = { { id = "dlg", t = "layer", x = 30, y = 30, w = 60, h = 50 } } } },
+        { "in a clipped viewport", 2, 200, 17.5, { sx = 10, sy = 13.5, vw = 100, vh = 70 } },
+        { "with another row paged too", 2, 25, 9, nil, { [5] = 60 } },
+    }
+    for _, c in ipairs(cases) do
+        local opts = { exclude = c[2] }
+        for k, v in pairs(c[5] or {}) do opts[k] = v end
+        local hoffs = { [c[2]] = c[3] }
+        for k, v in pairs(c[6] or {}) do hoffs[k] = v end
+        local s, at = compare_stack(rows, opts, c[4], hoffs)
+        ok(s, "a row left out of the window draws the same picture: " .. c[1],
+           at and ("first difference at pixel " .. at))
+    end
+    math.randomseed(6161)
+    local bad, first
+    local reads0 = bad_reads
+    for trial = 1, 150 do
+        local n = math.random(3, 7)
+        local ih = math.random(4, 18)
+        local rws = carousels(n, math.random(30, 420), ih, ih + math.random(1, 9),
+                              math.random(-10, 20))
+        local ex = math.random(1, n)
+        local hoffs = { [ex] = math.random(0, 300) }
+        for k = 1, n do
+            if k ~= ex and math.random() < 0.2 then hoffs[k] = math.random(0, 300) end
+        end
+        local opts = { exclude = ex, vw = math.random(60, SW), vh = math.random(30, SH) }
+        if math.random() < 0.3 then opts.chip = ex end
+        if math.random() < 0.2 then
+            opts.extra = { { id = "pop", t = "layer", x = math.random(0, 120),
+                y = math.random(0, 100), w = math.random(5, 60), h = math.random(3, 40) } }
+        end
+        local s, at = compare_stack(rws, opts, math.random(0, 80) + 0.5 * math.random(0, 1), hoffs)
+        if not s then
+            bad = (bad or 0) + 1
+            first = first or string.format("trial %d n=%d left out %d at %s", trial, n, ex, tostring(at))
+        end
+    end
+    ok(bad == nil, "left-out sweep: every frame matches the per-row picture", first)
+    ok(bad_reads == reads0, "and nothing read outside one bitmap ("
+       .. (bad_reads - reads0) .. ")")
+end
+
 -- ============================================================ 8. mixed widths
 -- Real carousels are not one width: a row narrower than the view is laid out
 -- only as wide as its content (Run D: requiring one width refused every real
@@ -771,6 +851,8 @@ do
     ok(merged == "1,1,1,1",
        "mixed-width carousels at rest cost one overlay-add per vertical frame ("
        .. merged .. "; without windows " .. plain .. ")")
+    local paged = per_frame({ win = true, fit = true, exclude = 3 }, { [3] = 40 })
+    ok(paged == "2,2,2,2", "and a paged one left out costs two (" .. paged .. ")")
 
     local narrow = carousels(5, 400, 14, 22, 4)
     narrow[3].view = 60                 -- a strip wider than a narrower view
@@ -780,6 +862,7 @@ do
         { "a strip wider than its own narrower viewport", narrow, {}, 5 },
         { "that row paged inside its narrow viewport", narrow, {}, 5, { [3] = 30 } },
         { "a poster row paged", home(), { fit = true }, 9, { [2] = 40 } },
+        { "a paged row left out", home(), { fit = true, exclude = 3 }, 9, { [3] = 40 } },
         { "a chip on the short row", home(), { fit = true, chip = 1 }, 0 },
         { "a chip on a poster row", home(), { fit = true, chip = 2 }, 5 },
         { "overlay arrows on a poster row", home(), { fit = true, arrows = 3 }, 5 },
@@ -824,6 +907,7 @@ do
             opts.extra = { { id = "pop", t = "layer", x = math.random(0, 120),
                 y = math.random(0, 100), w = math.random(5, 60), h = math.random(3, 40) } }
         end
+        if math.random() < 0.3 then opts.exclude = math.random(1, n) end
         local s, at = compare_stack(rws, opts, math.random(0, 80) + 0.25 * math.random(0, 3), hoffs)
         if not s then
             bad = (bad or 0) + 1

@@ -353,8 +353,14 @@ class HomePage(Page):
         # every frame. Section heights differ (poster vs landscape rows), so
         # the breakpoints are the explicit content-y of each section top,
         # not a uniform pitch.
+        #
+        # windows=True: while the page scrolls, the carousels near the
+        # viewport share ONE combined overlay instead of one each (measured
+        # on a real library: 4 overlay-adds and 16-18 ms a frame here,
+        # against 1 and ~9 ms on the library grid, which already had it).
+        # See TileRenderer.window_rows.
         rows = art.tiles.window_rows(rows, "home", size, 20,
-                                     pad=chrome.CONTENT_PAD)
+                                     pad=chrome.CONTENT_PAD, windows=True)
         return VScroll(Column(rows, pad=(0, chrome.CONTENT_PAD), gap=20),
                        id="home", flex=1,
                        offset=self.parked_scroll("home"),

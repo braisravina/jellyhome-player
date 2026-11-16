@@ -36,6 +36,7 @@ from jellyfin_mpv_shim.mpvtk.layout import layout
 from jellyfin_mpv_shim.mpvtk.rawimage import MemoryStore
 from jellyfin_mpv_shim.mpvtk.widgets import Column, ImageMap
 from jellyfin_mpv_shim.mpvtk_browser.strips import SiblingWindow, StripStore
+from jellyfin_mpv_shim.mpvtk_browser.scroll_state import ScrollState
 from jellyfin_mpv_shim.mpvtk_browser.tile_renderer import TileRenderer
 from tests.integration._harness import FakeMPV
 
@@ -711,6 +712,259 @@ class TestSiblingCarouselWindows(unittest.TestCase):
                 scaling.set_scale(1.0)
         self.assertTrue(results[1.0] and results[2.0],
                         "whole scales merge: %s" % results)
+
+
+class TestRealHomeScene(unittest.TestCase):
+    """The committed Home snapshot's scene, through the real window pipeline.
+
+    Every other test here builds its own carousels, and all of them were the
+    same width -- which is how a check that refused every real Home page
+    (unequal carousel widths, Run D) passed them all. This one builds the
+    scene the snapshot test pins, with the real Home page code, and asks
+    the real StripStore to window it."""
+
+    def test_the_real_home_scene_gets_one_window(self):
+        from jellyfin_mpv_shim.mpvtk.layout import layout
+        from tests._scene_snapshot import frozen_clock, load, normalize
+        from tests.test_scene_snapshots import SCREENS, build_browser
+
+        size = (1280, 720)
+        browser = build_browser()
+        with frozen_clock():
+            browser.nav_stack = [dict(SCREENS["home"])]
+            browser._load_route(browser.route)
+            browser._pool.shutdown(wait=True)
+            nodes, _handlers = layout(browser.build(size), *size)
+        self.assertEqual(normalize([dict(n) for n in nodes]), load("home"),
+                         "the scene is the committed snapshot")
+        marked = [n for n in nodes if n.get("t") == "img" and "wg" in n]
+        self.assertGreaterEqual(len(marked), 3)
+        self.assertTrue(all(isinstance(n["wg"], SiblingWindow) for n in marked))
+        widths = {n["id"]: [c for c in nodes if c.get("id") == n["sc"]][0]["w"]
+                  for n in marked}
+        self.assertGreater(len(set(widths.values())), 1,
+                           "the carousels differ in width, as real ones do: %s"
+                           % widths)
+        # Real buffers of the scene's own sizes, so the copy is real too.
+        store = StripStore(mem_store=MemoryStore())
+        self.addCleanup(store.shutdown)
+        for k, n in enumerate(marked):
+            e = store.bitmap(("home", k), _image(n["iw"], n["ih"], k + 1))
+            n["src"], n["v"] = e["src"], e["v"]
+        store.build_windows(nodes)
+        self.assertTrue(all("win" in n for n in marked),
+                        "every Home carousel is in the window")
+        self.assertEqual(len({n["win"]["src"] for n in marked}), 1)
+        self.assertEqual([n["win"]["i"] for n in marked],
+                         list(range(len(marked))))
+        self.assertTrue(all("wg" not in n for n in nodes))
+
+
+class TestHomeWindowMarking(unittest.TestCase):
+    """TileRenderer.window_rows(windows=True): which carousels are marked."""
+
+    class _Block(Column):
+        pass
+
+    def _renderer(self, offset, rows=None, cap=24 * 2 ** 20, view_w=1280):
+        """Just enough TileRenderer. ``offset[0]`` is the page's offset;
+        ``rows`` maps a carousel id to its offset -- an id it does not hold
+        is one ScrollState has no answer for, which reads as 0."""
+        rows = {} if rows is None else rows
+        fake = types.SimpleNamespace(
+            scroll=types.SimpleNamespace(
+                offset=lambda i: offset[0] if i == "home"
+                else float(rows.get(i) or 0.0)),
+            art=types.SimpleNamespace(strips=types.SimpleNamespace(
+                window_cap=lambda: cap)),
+            row_view_w=lambda: view_w,
+            WINDOW_SLACK=TileRenderer.WINDOW_SLACK,
+            WINDOW_LOOKAHEAD=TileRenderer.WINDOW_LOOKAHEAD)
+        fake.overlay_window_span = (
+            lambda *a: TileRenderer.overlay_window_span(fake, *a))
+        fake._mark_window = lambda *a: TileRenderer._mark_window(fake, *a)
+        return fake
+
+    def _blocks(self, n=12, h=320, awaiting=()):
+        """Carousel-shaped blocks: a fixed-height Column whose strip is the
+        ImageMap window_rows looks at (``_jms_strip``), and whose carousel
+        is ``row-<k>`` (``_jms_row_id``)."""
+        out = []
+        for k in range(n):
+            strip = ImageMap("&%d" % (k + 1), 10, 10, w=10, h=10,
+                             id="row-%d#strip" % k)
+            strip._jms_awaiting_art = k in awaiting
+            b = self._Block([], h=h)
+            b._jms_strip = strip
+            b._jms_row_id = "row-%d" % k
+            out.append(b)
+        return out
+
+    def _mark(self, fake, blocks, h=720):
+        for b in blocks:
+            b._jms_strip.win = None
+        TileRenderer.window_rows(fake, blocks, "home", (1280, h), 20,
+                                 windows=True)
+        return self._marked(blocks)
+
+    def test_a_paged_carousel_is_left_out_and_its_neighbours_kept(self):
+        for paged in (0, 1, 2):                 # first, middle, last marked
+            with self.subTest(paged=paged):
+                fake = self._renderer([0.0], rows={"row-%d" % paged: 250.0})
+                marked = self._mark(fake, self._blocks(n=3))
+                self.assertEqual(sorted(set(range(3)) - {paged}), marked)
+
+    def test_a_carousel_back_at_its_start_is_marked_again(self):
+        rows = {"row-1": 250.0}
+        fake = self._renderer([0.0], rows=rows)
+        blocks = self._blocks(n=3)
+        self.assertNotIn(1, self._mark(fake, blocks))
+        rows["row-1"] = 0.0
+        self.assertIn(1, self._mark(fake, blocks))
+        rows["row-1"] = ScrollState.EDGE         # within the edge slack
+        self.assertIn(1, self._mark(fake, blocks))
+
+    def test_an_unknown_position_keeps_the_row(self):
+        # No entry: ScrollState could not say (mpv < 0.36, never scrolled).
+        # The row stays in, and the renderer's per-frame checks are what
+        # keep the picture right -- the behaviour before rows were left out.
+        fake = self._renderer([0.0], rows={})
+        self.assertEqual(self._mark(fake, self._blocks(n=3)), [0, 1, 2])
+        bare = self._blocks(n=3)
+        for b in bare:
+            del b._jms_row_id                    # a block that names none
+        self.assertEqual(self._mark(fake, bare), [0, 1, 2])
+
+    def test_4k_falls_back_to_no_window_when_the_viewport_does_not_fit(self):
+        # The real cap; 337-line Home sections, a 1920-wide view at 2x.
+        fake = self._renderer([1500.0], view_w=1920)
+        blocks = self._blocks(n=12, h=337)
+        self.assertTrue(self._mark(fake, blocks, h=1020), "1x: a window")
+        scaling.set_scale(2.0)
+        try:
+            self.assertEqual(self._mark(fake, blocks, h=1020), [],
+                             "no partial window: every row draws alone")
+        finally:
+            scaling.set_scale(1.0)
+
+    def test_rows_left_out_do_not_shrink_a_window_into_fitting(self):
+        """At 4K the visible carousels do not fit; leaving some out (still
+        loading, or paged) must not let the REST through as a partial
+        window -- the shape that was slower than no window at all."""
+        # Rows 4-7 are on screen. Only 4 and 5 are eligible -- 6 is paged,
+        # the rest are loading -- and those two alone WOULD fit the cap.
+        fake = self._renderer([1500.0], view_w=1920, rows={"row-6": 300.0})
+        blocks = self._blocks(n=12, h=337,
+                              awaiting=set(range(12)) - {4, 5, 6})
+        two = (5 * 357 + 337 - 4 * 357) * 2 * 3840 * 4
+        self.assertLess(two, 24 * 2 ** 20, "the eligible pair alone fits")
+        scaling.set_scale(2.0)
+        try:
+            self.assertEqual(self._mark(fake, blocks, h=1020), [])
+        finally:
+            scaling.set_scale(1.0)
+
+    def test_the_viewport_alone_is_marked_when_the_span_does_not_fit(self):
+        # A cap between the two: the sticky span's rows do not fit, the
+        # viewport-plus-lookahead's do.
+        blocks = self._blocks(n=20, h=337)
+        top, vh = 3000.0, 720.0
+        ahead = TileRenderer.WINDOW_LOOKAHEAD
+        y = [k * (337 + 20) for k in range(20)]
+        need = [k for k in range(20)
+                if y[k] + 337 > top - ahead and y[k] < top + vh + ahead]
+        h_need = y[need[-1]] + 337 - y[need[0]]
+        fake = self._renderer([top], cap=1280 * 4 * int(h_need) + 64)
+        marked = self._mark(fake, blocks, h=int(vh))
+        self.assertEqual(marked, need)
+        fake = self._renderer([top], cap=1280 * 4 * int(h_need) - 64)
+        self.assertEqual(self._mark(fake, self._blocks(n=20, h=337), h=int(vh)),
+                         [], "and nothing when even that does not fit")
+
+    def _marked(self, blocks):
+        return [k for k, b in enumerate(blocks)
+                if b._jms_strip.win is not None]
+
+    def test_rows_near_the_viewport_are_marked_with_a_sibling_group(self):
+        offset = [0.0]
+        fake = self._renderer(offset)
+        blocks = self._blocks()
+        TileRenderer.window_rows(fake, blocks, "home", (1280, 720), 20,
+                                 pad=16, windows=True)
+        marked = self._marked(blocks)
+        self.assertTrue(marked and marked[0] == 0)
+        self.assertLess(marked[-1], 11, "far rows are left alone")
+        g = blocks[0]._jms_strip.win
+        self.assertIsInstance(g, SiblingWindow)
+        self.assertEqual(g, "home#win")
+
+    def test_without_windows_nothing_is_marked(self):
+        fake = self._renderer([0.0])
+        blocks = self._blocks()
+        TileRenderer.window_rows(fake, blocks, "home", (1280, 720), 20)
+        self.assertEqual(self._marked(blocks), [])
+
+    def test_a_row_still_waiting_for_posters_is_left_out(self):
+        fake = self._renderer([0.0])
+        blocks = self._blocks(awaiting={1})
+        TileRenderer.window_rows(fake, blocks, "home", (1280, 720), 20,
+                                 windows=True)
+        marked = self._marked(blocks)
+        self.assertNotIn(1, marked)
+        self.assertIn(0, marked)
+        self.assertIn(2, marked)
+
+    def test_a_lazy_row_is_marked_once_it_is_made_real(self):
+        fake = self._renderer([0.0])
+        real = self._blocks(n=1)[0]
+        stand_in = self._Block([], h=320)
+        stand_in._jms_realize = lambda: real
+        out = TileRenderer.window_rows(fake, [stand_in], "home", (1280, 720),
+                                       20, windows=True)
+        self.assertIs(out[0], real)
+        self.assertIsNotNone(real._jms_strip.win)
+
+    def test_the_span_is_sticky_and_covers_the_viewport(self):
+        """Every push, the viewport and what the renderer may scroll before
+        the next one are inside the span; and the MARKED ROWS -- which is
+        what decides whether a new window is copied -- change on a minority
+        of pushes. Rows of 337 + 20, the Home page's poster sections."""
+        ahead = TileRenderer.WINDOW_LOOKAHEAD
+        for h in (240, 720, 1080, 2160):
+            offset = [0.0]
+            fake = self._renderer(offset)
+            blocks = self._blocks(n=60, h=337)
+            changes, last, pushes = 0, None, 0
+            for off in range(0, 60 * 357 - h, 120):     # one push per STEP
+                offset[0] = float(off)
+                for b in blocks:
+                    b._jms_strip.win = None
+                TileRenderer.window_rows(fake, blocks, "home", (1280, h), 20,
+                                         windows=True)
+                y0, y1 = fake._overlay_windows[("span", "home",
+                                                float(max(240, h)))]
+                self.assertLessEqual(y0, max(0.0, off - ahead))
+                self.assertGreaterEqual(y1, off + max(240, h) + ahead)
+                marked = tuple(self._marked(blocks))
+                changes += marked != last
+                last = marked
+                pushes += 1
+            self.assertLess(changes, pushes * 0.5,
+                            "h=%d: the window would be rebuilt on %d of %d "
+                            "pushes" % (h, changes, pushes))
+
+    def test_art_in_flight(self):
+        fake = types.SimpleNamespace(
+            _requested={"a", "b", "c"},
+            _img_retry={"c": (TileRenderer.IMG_MAX_ATTEMPTS + 1, 0.0)},
+            IMG_MAX_ATTEMPTS=TileRenderer.IMG_MAX_ATTEMPTS,
+            art=types.SimpleNamespace(thumbs=types.SimpleNamespace(
+                is_gone=lambda k: k == "b")))
+        f = lambda k: TileRenderer._art_in_flight(fake, k)
+        self.assertTrue(f("a"), "requested, still coming")
+        self.assertFalse(f("b"), "the server has no such image")
+        self.assertFalse(f("c"), "given up on")
+        self.assertFalse(f("d"), "never asked for, or cooling off")
 
 
 if __name__ == "__main__":
