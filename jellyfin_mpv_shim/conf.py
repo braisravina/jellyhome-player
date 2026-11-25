@@ -1037,6 +1037,41 @@ class Settings(SettingsBase):
             changed = True
         return changed
 
+    #: The settings that become Jellyfin's MaxStreamingBitrate/MaxStaticBitrate.
+    BITRATE_KEYS = ("local_kbps", "remote_kbps")
+
+    def _normalize_bitrates(self, data):
+        """Bring a hand-edited bitrate value into range. Returns whether
+        anything changed (the caller saves).
+
+        **Every load, not a CONFIG_VERSION step.** This is a file people
+        edit by hand (docs/configuration.md), and an edit made after the
+        upgrade is just as reachable as one made before it. It is idempotent:
+        a valid value is never touched, so a second load changes nothing.
+
+        Read from ``data``, the raw JSON, not the attribute: ``parse_obj``
+        has already run ``int()``, which turns ``true`` into 1 kbps and
+        ``12.5`` into 12. The rules are bitrate_limits.normalize_kbps:
+        valid kept, <= 0 or above the ceiling becomes Unlimited, malformed
+        becomes the default. A missing key keeps its default without any
+        change here.
+        """
+        from .bitrate_limits import normalize_kbps
+
+        changed = False
+        for key in self.BITRATE_KEYS:
+            if key not in data:
+                continue
+            raw = data[key]
+            value = normalize_kbps(raw, getattr(type(self), key))
+            # `type is int`, not isinstance: a bool is an int, and "4000" or
+            # 4000.0 is rewritten as the plain integer it was read as.
+            if type(raw) is not int or raw != value:
+                log.info("Config: %s = %d (was %r)", key, value, raw)
+                setattr(self, key, value)
+                changed = True
+        return changed
+
     #: **Stated, on both ends, and `-sig` on the way in.** This file is one a
     #: person edits by hand (`docs/configuration.md` says so), which is where
     #: a non-ASCII character enters -- a `sync_path` under `D:/Filme/
@@ -1160,7 +1195,10 @@ class Settings(SettingsBase):
 
                 log.info("Loaded settings from json: %s" % path)
                 migrated = self._migrate(data)
-                if migrated or input_params < len(self.__fields__):
+                # Not `or`-ed into the line above: both must run.
+                normalized = self._normalize_bitrates(data)
+                if (migrated or normalized
+                        or input_params < len(self.__fields__)):
                     log.info("Saving back due to schema change.")
                     self.save()
             except Exception as e:

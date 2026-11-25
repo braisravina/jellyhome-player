@@ -10,6 +10,7 @@ import logging
 import sys
 import typing
 
+from .. import bitrate_limits
 from ..conf import Settings, settings
 from ..i18n import _, _p
 
@@ -1466,6 +1467,13 @@ def set_setting(key, value):
     schema = settings_schema()
     kind = schema.get(key)
     if kind is None:
+        return False
+    if key in Settings.BITRATE_KEYS and not bitrate_limits.is_valid_input(
+            value):
+        # 0, negative or too large would reach Jellyfin as "no limit" (and
+        # defeat an administrator's remote limit) or as an HTTP 400; refused
+        # here so the field says so instead of the value being rewritten on
+        # the next load. See bitrate_limits.
         return False
     try:
         # "" too: a cleared TextBox submits "", never None.

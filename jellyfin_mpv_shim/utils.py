@@ -7,7 +7,8 @@ import sys
 import os.path
 import platform
 
-from .conf import settings
+from .conf import Settings, settings
+from .bitrate_limits import normalize_kbps, wire_bps
 from datetime import datetime
 from functools import wraps
 from .constants import USER_APP_NAME
@@ -242,11 +243,19 @@ def get_profile(
     server_version: Optional[str] = None,
     image_sidecars: bool = True,
 ):
+    # Validated here, at the last step before the wire, and not only where
+    # the setting is entered or loaded: a CLI override, a direct assignment
+    # and the quality menu's override all arrive without passing either.
+    # See bitrate_limits for what Jellyfin does with 0, negative, null,
+    # omitted and overflowing values (each was measured).
+    key = "remote_kbps" if is_remote else "local_kbps"
+    setting_kbps = normalize_kbps(getattr(settings, key),
+                                  getattr(Settings, key))
     if video_bitrate is None:
-        if is_remote:
-            video_bitrate = settings.remote_kbps
-        else:
-            video_bitrate = settings.local_kbps
+        max_bps = setting_kbps * 1000
+    else:
+        # A malformed override falls back to the setting it overrides.
+        max_bps = wire_bps(video_bitrate, setting_kbps)
 
     if settings.force_video_codec:
         transcode_codecs = settings.force_video_codec
@@ -272,8 +281,8 @@ def get_profile(
 
     profile = {
         "Name": USER_APP_NAME,
-        "MaxStreamingBitrate": video_bitrate * 1000,
-        "MaxStaticBitrate": video_bitrate * 1000,
+        "MaxStreamingBitrate": max_bps,
+        "MaxStaticBitrate": max_bps,
         "MusicStreamingTranscodingBitrate": 1280000,
         "TimelineOffsetSeconds": 5,
         "TranscodingProfiles": [
