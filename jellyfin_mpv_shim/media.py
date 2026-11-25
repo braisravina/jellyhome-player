@@ -691,15 +691,20 @@ class Video(object):
         self.transcode_reasons = []
         self.direct_path = False
         # Only use Direct Paths if:
-        # - The media source supports direct paths.
+        # - The server allowed Direct Play of this source (PlaybackInfo's
+        #   SupportsDirectPlay). An HTTP source needs it too: this used to
+        #   read `Protocol == "Http" or SupportsDirectPlay`, so the protocol
+        #   alone opened the origin url and an explicit refusal was ignored.
+        #   Measured on 10.11.8: ForceRemoteSourceTranscoding answers an
+        #   HTTP .strm with SupportsDirectPlay false, Protocol Http and the
+        #   origin url as Path, and the transcode the administrator required
+        #   never happened. Missing counts as refused.
+        #   tests/test_http_direct_path_policy.py.
         # - Direct paths are enabled in the config.
         # - The server is local or the override config is set.
         # - If there's a scheme specified or the path exists as a local file.
         if (
-            (
-                self.media_source.get("Protocol") == "Http"
-                or self.media_source["SupportsDirectPlay"]
-            )
+            self.media_source.get("SupportsDirectPlay") is True
             and settings.direct_paths
             and (settings.remote_direct_paths
                  or self.parent.direct_path_trusted)
