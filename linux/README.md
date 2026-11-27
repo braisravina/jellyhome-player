@@ -1,11 +1,11 @@
 # Linux package (Debian 13 / amd64)
 
-`build-deb.sh` builds `publish/Linux/jellyhome-player_<version>-1_amd64.deb` from the working tree. It installs
-nothing on the build machine: everything happens in a temporary directory. Design notes and the licence story are in
+`build-deb.sh` builds `publish/Linux/jellyhome-player_<version>-1_amd64.deb` from the **HEAD commit** (see *Source*
+below), never from uncommitted files. It installs nothing on the build machine: everything happens in a temporary directory. Design notes and the licence story are in
 `docs/packaging.md` section 7; what has and has not been verified is in `docs/native-verification.md`.
 
 ```sh
-linux/build-deb.sh                       # needs dpkg-deb, python3 3.13 with pip + setuptools>=77, network
+linux/build-deb.sh                       # needs git, dpkg-deb, python3 3.13 with pip + setuptools>=77, network
 sha256sum -c publish/Linux/jellyhome-player_*_amd64.deb.sha256
 sudo apt install ./publish/Linux/jellyhome-player_3.3.0-1_amd64.deb     # apt resolves the dependencies
 ```
@@ -21,7 +21,20 @@ sudo apt install ./publish/Linux/jellyhome-player_3.3.0-1_amd64.deb     # apt re
 ## What the build does and what it can be told
 
 Environment variables: `OUT` (output directory), `SOURCE_DATE_EPOCH` (default: the HEAD commit time),
-`DEB_MAINTAINER` (`"Name <address>"`), and `SHADER_PACK_TAG` together with `SHADER_PACK_TREE_SHA256`.
+`DEB_MAINTAINER` (`"Name <address>"`), `SHADER_PACK_TAG` together with `SHADER_PACK_TREE_SHA256`, and the developer
+override `DEB_ALLOW_DIRTY=1` (below). `DEB_STOP_AFTER_STAGING=<dir>` exists for the tests only.
+
+* **Source.** A release build exports every path it reads from HEAD with `git archive` (the application,
+  `pyproject.toml`, `MANIFEST.in`, `README.md`, `LICENSE.md`, `THIRD_PARTY_NOTICES.md`, `linux/` and the four
+  `tools/` helpers it runs) and builds only from that export. It **refuses to start** (exit 2) while any of those
+  paths differs from HEAD -- a modified, staged, deleted or untracked-but-not-ignored file -- and lists them; it
+  changes, stashes or deletes nothing. Untracked or modified files elsewhere (`docs/`, `tests/`, other `tools/`,
+  `.claude/`) do not block the build and cannot reach it. Commit, or move work out of the packaged paths, to build.
+* **Developer override.** `DEB_ALLOW_DIRTY=1` builds the working tree as it is (tracked plus
+  untracked-but-not-ignored files), with a warning. The package is marked as not a release: Debian revision
+  `1~dirty` (it sorts below `1`, so the release upgrades over it, and `artifacts.sh` never collects it), a line in its
+  description, and `release build: NO` plus the differing paths in the manifest. It is refused when `CI=true` or
+  `GITHUB_ACTIONS` is set, and no workflow sets it. Any other value than `1` is an error.
 
 * **Shader pack.** Pinned in the script to a release tag *and* the SHA-256 of its extracted tree; the build fails if
   the download differs. To move to another release, look at it, then change `PINNED_SHADER_PACK_TAG` and
@@ -32,8 +45,9 @@ Environment variables: `OUT` (output directory), `SOURCE_DATE_EPOCH` (default: t
   `DEB_MAINTAINER` to a real name and address; none is invented here.
 * **Reproducibility.** Same commit, same `SOURCE_DATE_EPOCH`, same shader pin and the same Python / pip / setuptools /
   wheel versions give a byte-identical package (checked: two builds, identical SHA-256). CI pins pip 25.1.1,
-  setuptools 78.1.1 and wheel 0.46.1; the manifest next to the package records the versions used, the source commit
-  (and whether the packaged paths were dirty), the shader pack tag and the lock file's hash.
+  setuptools 78.1.1 and wheel 0.46.1; the manifest next to the package records whether it is a release build, the source
+  commit and its tree, a SHA-256 of the staged application source, the versions used, the shader pack tag and the
+  lock file's hash.
 
 ## Dependencies, as declared
 

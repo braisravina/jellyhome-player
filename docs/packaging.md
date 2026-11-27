@@ -332,8 +332,10 @@ ID, see `macos/README.md`.
 
 ## 7. The Linux `.deb` (Debian 13, amd64)
 
-`linux/build-deb.sh` builds `publish/Linux/jellyhome-player_<version>-1_amd64.deb` from the working tree and installs
-nothing on the build machine. Status of every platform, and what has and has not been run: `docs/native-verification.md`.
+`linux/build-deb.sh` builds `publish/Linux/jellyhome-player_<version>-1_amd64.deb` from the HEAD commit and installs
+nothing on the build machine. A release build exports the packaged paths from HEAD with `git archive` and refuses to
+start while any of them differs from HEAD; `DEB_ALLOW_DIRTY=1` is a developer override whose package is marked
+`1~dirty` and "release build: NO" (`linux/README.md`, *Source*). Status of every platform, and what has and has not been run: `docs/native-verification.md`.
 
 **Shape.** The application and its Python libraries go in the private directory `/usr/lib/jellyhome-player/`, found by
 the launcher `/usr/bin/jellyhome-player` relative to its own path. It is **not** installed into
@@ -357,7 +359,7 @@ publisher signature. To update: change versions, `pip download --no-deps --only-
 
 **What is deliberately not in the package.** No `/etc/xdg/autostart` entry (autostart stays the app's own opt-in
 setting, off by default, and writes a per-user entry that points at the launcher through `JELLYHOME_LAUNCHER`); nothing
-in any home directory; no credentials or test state (the source is staged from `git ls-files` plus an allow-list, and the
+in any home directory; no credentials or test state (the source is exported from the commit with `git archive`, restricted to an allow-list of paths, and the
 script fails the build if a `cred*`, `users.json*`, `conf.json`, `*.db` or `log.txt` is in the bundle).
 
 **Reproducibility.** Two builds with the same commit and `SOURCE_DATE_EPOCH` produce byte-identical packages (SHA-256
@@ -367,9 +369,10 @@ embeds the temp build directory as `co_filename`); pip's `direct_url.json` and i
 temp wheel path); archive written with `--root-owner-group`. Inputs that are now pinned: the Python libraries (hash lock),
 the shader pack (release tag and the hash of its extracted tree, checked by the script), and in CI pip 25.1.1,
 setuptools 78.1.1 and wheel 0.46.1. Not pinned: the CPython patch release of the runner and the exact base image of the
-install test. The manifest next to the package records the tool versions, the source commit (and whether the packaged
-paths were dirty), the shader pack tag, the maintainer and the lock file's hash. A build from a dirty working tree
-is not reproducible from a commit; release builds come from CI on a checkout.
+install test. The manifest next to the package records whether it is a release build, the source commit and its tree, a SHA-256 of
+the staged application source, the tool versions, the shader pack tag, the maintainer and the lock file's hash. A
+release build cannot come from a dirty working tree (the script refuses); a `DEB_ALLOW_DIRTY=1` developer build is
+not reproducible from a commit and says so in its version, description and manifest.
 
 **Metadata.** `Maintainer:` defaults to a placeholder (the project's no-reply address); the build prints a note, and a
 release build sets `DEB_MAINTAINER="Name <address>"`. No personal details are invented.
