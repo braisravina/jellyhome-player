@@ -114,7 +114,13 @@ CONNECT_BUSY = "busy"
 #: the user can act on differently: everything else is "it did not work",
 #: which the form already says.
 REAUTH_WRONG_SERVER = "wrong_server"
-USER_AGENT = "Jellyfin-MPV-Shim/%s" % CLIENT_VERSION
+#: The HTTP User-Agent for requests to Jellyfin servers and the artwork they
+#: point to: "JellyHome-Player/<CLIENT_VERSION>". Built from USER_APP_NAME
+#: and CLIENT_VERSION so the name and version have one source each. It is
+#: only a label in access logs: the server identifies this client from the
+#: Authorization header (Client, Device, DeviceId, Version), which does not
+#: use this value, so changing it changes no device, session or saved login.
+USER_AGENT = "%s/%s" % (USER_APP_NAME.replace(" ", "-"), CLIENT_VERSION)
 CAPABILITIES = {
     # Written when the client played video and nothing else, and never
     # brought forward: music and photos both shipped against a list that
